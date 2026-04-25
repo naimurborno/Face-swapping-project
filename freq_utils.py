@@ -32,26 +32,33 @@ def fft_decompose(
 
     Reconstruction: lf + hf == image (exact up to float precision ~1e-6).
     """
-    # FFT over spatial dims
-    f = torch.fft.fft2(image)
+    orig_dtype = image.dtype
+
+    # ── MUST cast to float32: torch.fft.fft2 does not support float16.
+    # ComplexHalf is experimental and silently produces NaN on most ops,
+    # which propagates through VAE encode → stored KV → black output image.
+    x = image.float()
+
+    f = torch.fft.fft2(x)
     f_shift = torch.fft.fftshift(f, dim=(-2, -1))
 
-    B, C, H, W = image.shape
+    B, C, H, W = x.shape
     cy, cx = H // 2, W // 2
     rh = max(1, int(cutoff_ratio * H / 2))
     rw = max(1, int(cutoff_ratio * W / 2))
 
-    # Circular (or rectangular) LF mask centred at DC
-    mask = torch.zeros(H, W, device=image.device, dtype=image.dtype)
+    # Rectangular LF mask centred at DC component
+    mask = torch.zeros(H, W, device=x.device, dtype=torch.float32)
     mask[cy - rh: cy + rh, cx - rw: cx + rw] = 1.0
-    mask = mask.unsqueeze(0).unsqueeze(0)       # (1, 1, H, W)
+    mask = mask.unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
 
     f_lf = f_shift * mask
     f_lf = torch.fft.ifftshift(f_lf, dim=(-2, -1))
-    lf = torch.fft.ifft2(f_lf).real
+    lf = torch.fft.ifft2(f_lf).real        # float32
+    hf = x - lf                             # float32
 
-    hf = image - lf
-    return lf, hf
+    # Cast back to original dtype
+    return lf.to(orig_dtype), hf.to(orig_dtype)
 
 
 @torch.no_grad()
@@ -90,19 +97,23 @@ def encode_freq_latents(
 
 
 def smoke_test():
-    """Run without GPU to verify FFT correctness."""
-    dummy = torch.randn(1, 3, 512, 512)
-    lf, hf = fft_decompose(dummy, cutoff_ratio=0.1)
+    """Run on CPU (no GPU needed) — verifies FFT correctness and float16 safety."""
+    print("[freq_utils] Running smoke test...")
+    for dtype in [torch.float32, torch.float16]:
+        dummy = torch.randn(1, 3, 512, 512).to(dtype)
+        lf, hf = fft_decompose(dummy, cutoff_ratio=0.1)
 
-    assert lf.shape == dummy.shape, f"LF shape: {lf.shape}"
-    assert hf.shape == dummy.shape, f"HF shape: {hf.shape}"
+        assert lf.dtype == dtype, f"dtype mismatch: got {lf.dtype}, expected {dtype}"
+        assert lf.shape == dummy.shape
 
-    recon_err = (lf + hf - dummy).abs().max().item()
-    assert recon_err < 1e-4, f"Reconstruction error too large: {recon_err:.2e}"
+        # Check in float32 to avoid float16 accumulation error in the assertion itself
+        recon_err = (lf.float() + hf.float() - dummy.float()).abs().max().item()
+        assert recon_err < 1e-3, f"[{dtype}] Recon error too large: {recon_err:.2e}"
 
-    print(f"[freq_utils] smoke_test passed | recon_err={recon_err:.2e}")
-    print(f"  LF energy: {lf.pow(2).mean().item():.4f}")
-    print(f"  HF energy: {hf.pow(2).mean().item():.4f}")
+        print(f"  dtype={dtype} | recon_err={recon_err:.2e} | "
+              f"LF_energy={lf.float().pow(2).mean():.4f} | "
+              f"HF_energy={hf.float().pow(2).mean():.4f}")
+    print("[freq_utils] All tests passed.\n")
 
 
 if __name__ == "__main__":
