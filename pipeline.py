@@ -74,19 +74,24 @@ def run_face_swap(
     # Denoising loop
     for i, t in enumerate(timesteps):
         # ── REFERENCE PASS: store K,V from reference at this timestep ──
+        # ── REFERENCE PASS ──
         noisy_ref = pipe.scheduler.add_noise(
-            ref_latent, torch.randn_like(ref_latent, generator=generator), t.unsqueeze(0)
+            ref_latent,
+            torch.randn_like(ref_latent, generator=generator),
+            t.unsqueeze(0)
         )
         kv_cache.set_mode("store")
         kv_cache.clear()
 
-        ref_input = torch.cat([noisy_ref] * 2) if guidance_scale > 1.0 else noisy_ref
-        _ = pipe.unet(
-            ref_input,
-            t,
-            encoder_hidden_states=prompt_embeds if guidance_scale > 1.0
-                                  else negative_prompt_embeds,
-        ).sample
+        if guidance_scale > 1.0:
+            # Match source pass: run with [uncond, cond] concatenated
+            ref_input = torch.cat([noisy_ref] * 2)
+            ref_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+        else:
+            ref_input = noisy_ref
+            ref_embeds = prompt_embeds
+
+        _ = pipe.unet(ref_input, t, encoder_hidden_states=ref_embeds).sample
 
         # ── SOURCE PASS: inject stored K,V during source denoising ──
         kv_cache.set_mode("inject")
