@@ -137,3 +137,11 @@ logging:
   save_intermediates: false   # save LF/HF/aligned images alongside final result
   verbose:            true    # print per-step cache summary
   save_meta:          true    # write meta.json to artifacts/ after stage1
+
+compositing:
+  poisson_blend: true   # true = Poisson seamless clone (removes seam)
+                        # false = feathered alpha blend only (debug mode)
+  feather_px: 8         # Gaussian blur radius for mask edge softening.
+                        # 0 = hard binary mask (shows exact mask boundary).
+                        # 8 = default, softens ~16px boundary region.
+                        # Increase if seam is still visible after Poisson.

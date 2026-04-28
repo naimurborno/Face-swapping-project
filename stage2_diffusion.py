@@ -64,6 +64,7 @@ import traceback
 import torch
 import yaml
 from PIL import Image
+from core.compositing import composite_result
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,7 +105,7 @@ def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
     Apply CLI overrides on top of the yaml config.
     Only keys explicitly passed on the command line are overridden.
     """
-    if args.artifacts_dir is not None:
+    if args.artifacts is not None:
         cfg["paths"]["artifacts_dir"] = args.artifacts_dir
     if args.output_dir is not None:
         cfg["paths"]["output_dir"] = args.output_dir
@@ -774,14 +775,33 @@ def run_stage2(cfg: dict):
 
     # ── Step 4: Decode ────────────────────────────────────────────────────
     _section("Step 4 — Decode latent → image")
-    result_pil = decode_latent(pipe, latents)
-    print(f"[stage2] Decoded: {result_pil.size} {result_pil.mode}")
-
+    generated_pil = decode_latent(pipe, latents)
+    print(f"[stage2] Decoded: {generated_pil.size} {generated_pil.mode}")
+ 
+    # ── Step 4b: Composite ────────────────────────────────────────────────
+    # Paste generated face onto source background using the face mask.
+    # This preserves the source image exactly outside the mask region —
+    # background, hair, neck, clothing are all taken directly from source.
+    # Poisson blending removes the color seam at the mask boundary.
+    # Skip compositing only when mask_type="none" (global injection mode).
+    _section("Step 4b — Composite result onto source")
+    if cfg["ablation"]["mask_type"] == "none":
+        result_pil = generated_pil
+        print("[stage2] mask_type=none — skipping compositing (global injection mode).")
+    else:
+        result_pil = composite_result(
+            generated_pil    = generated_pil,
+            source_pil       = artifacts["source_pil"],
+            face_mask_tensor = artifacts["face_mask"],
+            cfg              = cfg,
+        )
+        print(f"[stage2] Compositing complete: {result_pil.size}")
+ 
     # ── Step 5: Save ──────────────────────────────────────────────────────
     _section("Step 5 — Save outputs")
     stage2_meta = build_stage2_meta(cfg, stage1_meta)
     result_path = save_results(result_pil, artifacts, cfg, stage2_meta)
-
+ 
     return result_pil, result_path
 
 
