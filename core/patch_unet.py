@@ -51,7 +51,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention
 
-from kv_attention import KVInjectionAttention
+from core.kv_attention import KVInjectionAttention
 
 
 # ── Depth classification ──────────────────────────────────────────────────────
