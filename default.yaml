@@ -1,0 +1,139 @@
+# ============================================================
+# default.yaml — Master config for the face swap pipeline
+# ============================================================
+# All hyperparameters, paths, and ablation flags live here.
+# One flag = one change. No code surgery needed for ablations.
+# ============================================================
+
+
+# ── Paths ────────────────────────────────────────────────────
+paths:
+  source_image:     "inputs/source.jpg"       # source face (pose/background to keep)
+  reference_image:  "inputs/reference.jpg"    # reference face (identity to transfer)
+  artifacts_dir:    "artifacts/"              # stage1 saves here, stage2 reads from here
+  output_dir:       "outputs/"               # final results saved here
+  landmark_model:   "face_landmarker.task"    # MediaPipe face landmarker model file
+  sam_checkpoint:   "sam_vit_h_4b8939.pth"   # SAM model checkpoint
+  sam_model_type:   "vit_h"                   # "vit_h" | "vit_l" | "vit_b" | "mobile"
+
+
+# ── Image settings ───────────────────────────────────────────
+image:
+  target_size: 512        # 512 for sd-2-1-base | 768 for sd-2-1
+
+
+# ── Stage 1: Segmentation + Alignment ───────────────────────
+stage1:
+  # MediaPipe alignment
+  mediapipe:
+    min_face_detection_confidence: 0.3
+    min_face_presence_confidence:  0.3
+    max_yaw_warning_deg:           35.0     # warn if yaw diff exceeds this
+
+  # Gaussian decomposition (used when ablation.decomposition = "gaussian")
+  gaussian:
+    kernel: 31          # must be odd. larger = smoother LF, more detail in HF
+    sigma:  5.0         # larger = more LF bleed
+
+  # FFT decomposition (used when ablation.decomposition = "fft")
+  fft:
+    cutoff_ratio: 0.1   # inner 10% of spectrum = LF. raise if LF still has edges.
+
+  # SAM segmentation (used when ablation.mask_type = "sam")
+  sam:
+    points_per_side:      32
+    pred_iou_thresh:      0.88
+    stability_score_thresh: 0.95
+    prompt_strategy:      "nose_tip"    # "nose_tip" | "bbox" | "eye_center"
+    # nose_tip   → uses MediaPipe landmark index 4 as point prompt
+    # bbox       → uses bounding box from landmark extents
+    # eye_center → uses midpoint between both eye centers
+
+  # Convex hull mask (used when ablation.mask_type = "convex_hull")
+  convex_hull:
+    dilation_px: 10     # pixels to dilate mask outward to avoid hard seams
+
+
+# ── Stage 2: Diffusion pipeline ─────────────────────────────
+stage2:
+  model_id:            "stabilityai/stable-diffusion-2-1-base"
+  torch_dtype:         "float16"      # "float16" | "float32"
+  enable_cpu_offload:  false          # set true if VRAM < 10GB
+
+  scheduler:           "DDIM"         # "DDIM" | "PNDM" | "DPMSolver"
+
+  prompt:              "portrait photo, sharp focus, photorealistic"
+  negative_prompt:     "blurry, deformed, cartoon, anime, low quality"
+
+  num_inference_steps: 30
+  guidance_scale:      7.5
+  seed:                42
+
+
+# ── KV Injection ─────────────────────────────────────────────
+injection:
+  injection_scale: 0.8    # global lambda multiplier. sweep [0.3, 0.5, 0.8, 1.0]
+
+  # Depth classification — U-Net layer prefixes for SD2.1-base (512px)
+  # deep   → 8×8 / 16×16 spatial resolution → captures LF structure
+  # shallow→ 64×64 spatial resolution        → captures HF texture
+  depth:
+    deep_prefixes:
+      - "mid_block"
+      - "down_blocks.2"
+      - "up_blocks.1"
+    shallow_prefixes:
+      - "down_blocks.0"
+      - "up_blocks.3"
+
+
+# ── Ablation flags ───────────────────────────────────────────
+# Change ONE flag at a time for a clean ablation study.
+ablation:
+
+  # A1 — Frequency decomposition method
+  # "gaussian" : Gaussian blur split (default, no ringing artifacts)
+  # "fft"      : FFT rectangular mask split (compare ringing vs Gaussian)
+  # "none"     : whole aligned image used as both LF and HF (no split)
+  decomposition: "gaussian"
+
+  # A2 — Depth routing assignment
+  # "correct"  : deep=LF, shallow=HF  (proposed method)
+  # "swapped"  : deep=HF, shallow=LF  (inverted routing, should degrade)
+  # "uniform"  : all layers get same cache regardless of depth
+  depth_routing: "correct"
+
+  # A3 — Spatial injection mask
+  # "sam"          : SAM segmentation mask (tight, semantic boundary)
+  # "convex_hull"  : MediaPipe landmark convex hull (rough polygon)
+  # "none"         : global injection, no spatial gating
+  mask_type: "sam"
+
+  # A4 — Temporal lambda annealing
+  # true  : λ_LF dominant early (high noise), λ_HF dominant late (low noise)
+  # false : flat lambdas, both set to injection_scale throughout
+  temporal_anneal: true
+
+  # A5 — Pipeline mode
+  # "phase3" : freq-decomposed KV injection (full proposed method)
+  # "phase2" : naive baseline — single aligned reference, no freq split, flat lambdas
+  mode: "phase3"
+
+
+# ── Ablation sweep config (used by ablation/ablation_runner.py) ──────
+# Define all conditions to sweep. Runner creates one output per condition.
+ablation_sweep:
+  injection_scale: [0.3, 0.5, 0.8, 1.0]   # A6 — injection strength sensitivity
+
+  # Pose robustness bucketing (used for reporting, not for running)
+  yaw_buckets:
+    small:  [0,  15]    # degrees
+    medium: [15, 35]
+    large:  [35, 999]
+
+
+# ── Logging ──────────────────────────────────────────────────
+logging:
+  save_intermediates: false   # save LF/HF/aligned images alongside final result
+  verbose:            true    # print per-step cache summary
+  save_meta:          true    # write meta.json to artifacts/ after stage1
