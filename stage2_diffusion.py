@@ -181,6 +181,7 @@ def load_artifacts(artifacts_dir: str) -> dict:
         "hf_pil.png"      : "PIL",
         "face_mask.pt"    : "tensor",
         "meta.json"       : "json",
+        "chimera_pil.png" : "PIL",
     }
 
     missing = [
@@ -202,6 +203,7 @@ def load_artifacts(artifacts_dir: str) -> dict:
     aligned_pil = Image.open(_path("aligned_pil.png")).convert("RGB")
     lf_pil      = Image.open(_path("lf_pil.png")).convert("RGB")
     hf_pil      = Image.open(_path("hf_pil.png")).convert("RGB")
+    chimera_pil = Image.open(_path("chimera_pil.png")).convert("RGB")
 
     # Load mask tensor — map_location="cpu" so it loads regardless of GPU state
     face_mask = torch.load(_path("face_mask.pt"), map_location="cpu")
@@ -222,6 +224,7 @@ def load_artifacts(artifacts_dir: str) -> dict:
         "hf_pil"      : hf_pil,
         "face_mask"   : face_mask,
         "meta"        : meta,
+        "chimera_pil" : chimera_pil,
     }
 
 
@@ -435,13 +438,11 @@ def run_denoising_loop(
                                 artifacts["source_pil"])
 
     if mode == "phase3":
-        lf_lat = _encode_to_latent(pipe.vae, pipe.image_processor,
-                                   artifacts["lf_pil"])
-        hf_lat = _encode_to_latent(pipe.vae, pipe.image_processor,
-                                   artifacts["hf_pil"])
+        chimera_lat = _encode_to_latent(pipe.vae, pipe.image_processor,
+                                        artifacts["chimera_pil"])
         print(
             f"[stage2] Encoded: src={tuple(src_lat.shape)} | "
-            f"lf={tuple(lf_lat.shape)} | hf={tuple(hf_lat.shape)}"
+            f"chimera={tuple(chimera_lat.shape)}  [phase3 — chimera store]"
         )
     else:  # phase2
         ref_lat = _encode_to_latent(pipe.vae, pipe.image_processor,
@@ -509,23 +510,18 @@ def run_denoising_loop(
         # ── Phase 3: two store passes (LF then HF) ────────────────────────
         if mode == "phase3":
 
-            # Pass 1 — store LF: captures global structure into deep layers
-            # Add fresh noise at timestep t to the LF latent so the reference
-            # and source are at the same noise level when features are compared.
-            lf_noise = torch.randn_like(lf_lat, generator=gen)
-            noisy_lf = pipe.scheduler.add_noise(lf_lat, lf_noise, t.unsqueeze(0))
+            chimera_noise = torch.randn_like(chimera_lat, generator=gen)
+            noisy_chimera = pipe.scheduler.add_noise(
+                chimera_lat, chimera_noise, t.unsqueeze(0)
+            )
 
             kv_cache.set_freq_mode("lf")
             kv_cache.set_mode("store")
-            _store_pass(pipe.unet, noisy_lf, t, ref_embeds, kv_cache)
+            _store_pass(pipe.unet, noisy_chimera, t, ref_embeds, kv_cache)
 
-            # Pass 2 — store HF: captures texture detail into shallow layers
-            hf_noise = torch.randn_like(hf_lat, generator=gen)
-            noisy_hf = pipe.scheduler.add_noise(hf_lat, hf_noise, t.unsqueeze(0))
-
-            kv_cache.set_freq_mode("hf")
-            kv_cache.set_mode("store")
-            _store_pass(pipe.unet, noisy_hf, t, ref_embeds, kv_cache)
+            # Mirror lf_cache → hf_cache so shallow layers find features
+            # during the inject pass (kv_attention reads _hf_cache for shallow)
+            kv_cache._hf_cache = dict(kv_cache._lf_cache)
 
         # ── Phase 2: single store pass (whole aligned reference) ──────────
         else:

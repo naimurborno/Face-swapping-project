@@ -1,40 +1,61 @@
 # core/compositing.py
 """
-Post-diffusion compositing module.
+Frequency-decomposed compositing module.
 
 Problem this solves:
-    The diffusion denoising loop regenerates the ENTIRE image — background,
-    hair, neck, clothing all drift slightly from the source even though KV
-    injection only targets the face region. The KV mask gates attention
-    features but cannot prevent the diffusion process from altering pixels
-    outside the face.
+    After KV injection, the diffusion output has the right identity but wrong
+    color/skin tone relative to the source. A naive hard composite or even
+    Poisson blending cannot fix a global color mismatch — it only smooths
+    the boundary seam. The face still looks stitched because LF (skin tone,
+    color temperature) and HF (texture detail, edges) need to be handled
+    separately.
 
-Solution:
-    After decoding the final latent to a PIL image, composite the result
-    back onto the source using the face mask:
+Solution — Frequency-decomposed compositing:
+    Instead of blending the full images directly, split both the source and
+    the generated image into LF and HF components, blend each frequency band
+    independently with the appropriate technique, then reconstruct:
 
-        final = source × (1 - mask) + generated × mask
+        source_LF,    source_HF    = decompose(source)
+        generated_LF, generated_HF = decompose(generated)
 
-    Everything outside the mask comes directly from source pixels.
-    Everything inside the mask comes from the generated image.
+        final_LF = blend_lf(source_LF, generated_LF, mask)
+                   ← color transfer here (LAB statistics matching)
+                   ← ensures skin tone continuity at LF level
 
-    A hard composite at the mask boundary creates a visible seam because
-    the generated face has slightly different color/brightness at the edges
-    due to lighting normalization in diffusion. Poisson blending
-    (cv2.seamlessClone) smooths this transition by solving a gradient-domain
-    optimization that matches interior gradients from the generated image
-    while matching boundary conditions from the source.
+        final_HF = blend_hf(source_HF, generated_HF, mask)
+                   ← Poisson blending here (seam removal at HF level)
+                   ← HF is where hard seams are most perceptually visible
+
+        final = clip(final_LF + final_HF)
+
+    Why this works:
+        LF carries global color, brightness, and skin tone.
+        Matching LF color statistics (color transfer) eliminates the
+        color mismatch that makes faces look stitched.
+
+        HF carries edges, texture, and fine detail.
+        Poisson blending on HF removes the boundary seam without
+        affecting the color balance fixed in the LF step.
+
+        Separating the two allows each problem to be solved with the
+        right tool at the right frequency scale.
+
+Novel contribution for paper:
+    Prior work uses frequency decomposition for KV injection guidance
+    (Stage 1 of this pipeline) OR for image compositing — never both
+    in the same pipeline. This module extends frequency decomposition
+    end-to-end: Stage 1 decomposes for injection, Stage 2 decomposes
+    for compositing. LF and HF are treated as first-class signals
+    throughout the entire face swap pipeline.
+
+Ablation flag (configs/default.yaml):
+    compositing:
+      freq_decomposed: true    # true = novel freq-decomposed path
+                               # false = old hard composite + Poisson only
 
 Public API:
     composite_result(generated_pil, source_pil, face_mask_tensor, cfg)
         → PIL RGB final image
-
-    The cfg argument reads one flag:
-        cfg["compositing"]["poisson_blend"]  (bool, default True)
-
-    If poisson_blend=False, returns the hard composite without seam removal.
-    This is useful for debugging — a visible seam confirms the mask boundary
-    is correct before Poisson blending hides it.
 """
 
 import cv2
@@ -43,174 +64,348 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from core.decomposition import decompose_pil
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MASK PREPARATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _prepare_mask(
-    face_mask_tensor: torch.Tensor,   # (1, 1, H, W) float32 [0, 1]
-    target_size:      tuple,           # (W, H) — PIL convention
+    face_mask_tensor: torch.Tensor,
+    target_size:      tuple,
     feather_px:       int = 8,
 ) -> np.ndarray:
     """
-    Convert the face mask tensor to a uint8 numpy mask at target_size.
-
-    Steps:
-        1. Resize mask tensor to target_size using bilinear interpolation
-        2. Convert to uint8 [0, 255]
-        3. Feather (Gaussian blur) the edges to avoid hard seams
-           even before Poisson blending — feathering softens the
-           hard composite fallback and makes Poisson blending more stable.
+    Resize face mask tensor to target_size and feather edges.
 
     Args:
-        face_mask_tensor : (1, 1, H, W) float32 mask from Stage 1.
-                           1 = face region (inject here), 0 = background.
-        target_size      : (W, H) tuple — PIL image size convention.
-        feather_px       : Gaussian blur radius in pixels for edge softening.
-                           0 = no feathering (hard binary mask).
-                           8 = default, softens a ~16px boundary region.
+        face_mask_tensor : (1, 1, H, W) float32 [0,1] from artifacts/face_mask.pt
+        target_size      : (W, H) PIL convention
+        feather_px       : Gaussian blur radius. 0 = hard binary mask.
 
     Returns:
-        mask_uint8 : (H, W) uint8 numpy array, values 0–255.
-                     255 = face pixel, 0 = background pixel,
-                     gradient at boundary if feather_px > 0.
+        (H, W) uint8 numpy, 0-255. 255 = face region.
     """
     W, H = target_size
 
-    # Resize mask to match the output image resolution
     resized = F.interpolate(
         face_mask_tensor.float(),
         size=(H, W),
         mode="bilinear",
         align_corners=False,
-    )  # (1, 1, H, W)
-
-    # Convert to uint8 numpy
+    )
     mask_np = (resized.squeeze().cpu().numpy() * 255).astype(np.uint8)
 
-    # Feather edges — reduces hard seam even before Poisson blending
     if feather_px > 0:
-        ksize = feather_px * 2 + 1   # must be odd
+        ksize   = feather_px * 2 + 1
         mask_np = cv2.GaussianBlur(mask_np, (ksize, ksize), sigmaX=feather_px / 2)
 
     return mask_np
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HARD COMPOSITE
+# COLOR TRANSFER  (LAB Reinhard — applied inside LF blend)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _hard_composite(
-    generated_bgr: np.ndarray,   # (H, W, 3) uint8
-    source_bgr:    np.ndarray,   # (H, W, 3) uint8
-    mask_uint8:    np.ndarray,   # (H, W)    uint8  [0, 255]
+def _color_transfer_lab(
+    source_lf:    np.ndarray,   # (H, W, 3) float32 BGR [0, 255]
+    generated_lf: np.ndarray,   # (H, W, 3) float32 BGR [0, 255]
+    mask_uint8:   np.ndarray,   # (H, W) uint8
 ) -> np.ndarray:
     """
-    Alpha-blend generated face onto source using the face mask.
+    Match LAB color statistics of generated_lf to source_lf inside the mask.
 
-        final = source × (1 - α) + generated × α
-        where α = mask / 255.0  ∈ [0, 1]
+    Reinhard color transfer per LAB channel:
+        corrected = (generated - mean_gen) / std_gen * std_src + mean_src
 
-    With a feathered mask, this produces a smooth transition at the boundary.
-    With a hard binary mask, the seam is visible — use Poisson blending
-    to remove it.
+    Applied to LF only so HF texture detail is untouched.
+    Statistics computed inside the face mask so background
+    pixels don't pollute the color matching.
 
     Args:
-        generated_bgr : BGR uint8 output from the diffusion pipeline.
-        source_bgr    : BGR uint8 original source image.
-        mask_uint8    : (H, W) uint8 mask — face region is 255.
+        source_lf    : LF of source — defines target color stats.
+        generated_lf : LF of generated — will be color-corrected.
+        mask_uint8   : Face region mask.
 
     Returns:
-        (H, W, 3) uint8 BGR composite image.
+        (H, W, 3) float32 BGR color-corrected LF.
     """
-    alpha = mask_uint8.astype(np.float32) / 255.0   # (H, W) float [0, 1]
-    alpha = alpha[:, :, np.newaxis]                  # (H, W, 1) for broadcast
+    src_uint8 = np.clip(source_lf,    0, 255).astype(np.uint8)
+    gen_uint8 = np.clip(generated_lf, 0, 255).astype(np.uint8)
 
+    # Convert to OpenCV LAB range: L [0,255], A [0,255], B [0,255]
+    src_lab = cv2.cvtColor(src_uint8, cv2.COLOR_BGR2LAB).astype(np.float32)
+    gen_lab = cv2.cvtColor(gen_uint8, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    face_bool = mask_uint8 > 127
+
+    if face_bool.sum() == 0:
+        print("[compositing] WARNING: empty mask in color transfer — skipping.")
+        return generated_lf.copy()
+
+    corrected_lab = gen_lab.copy()
+
+    for ch in range(3):
+        src_pixels = src_lab[:, :, ch][face_bool]
+        gen_pixels = gen_lab[:, :, ch][face_bool]
+
+        src_mean, src_std = float(src_pixels.mean()), float(src_pixels.std())
+        gen_mean, gen_std = float(gen_pixels.mean()), float(gen_pixels.std())
+
+        if gen_std < 1e-6:
+            continue
+
+        corrected_lab[:, :, ch] = (
+            (gen_lab[:, :, ch] - gen_mean) / gen_std
+        ) * src_std + src_mean
+
+    # Clip to valid OpenCV LAB uint8 range [0, 255]
+    corrected_lab = np.clip(corrected_lab, 0, 255).astype(np.uint8)
+    corrected_bgr = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
+
+    return corrected_bgr.astype(np.float32)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POISSON BLENDING  (seam removal — applied inside HF blend)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _poisson_blend(
+    generated_bgr: np.ndarray,   # (H, W, 3) uint8
+    source_bgr:    np.ndarray,   # (H, W, 3) uint8
+    mask_uint8:    np.ndarray,   # (H, W) uint8
+) -> np.ndarray:
+    """
+    Poisson seamless cloning at the mask boundary.
+
+    Preserves gradient structure from generated_bgr inside the mask
+    while matching color values from source_bgr at the boundary.
+
+    Falls back to alpha blend if seamlessClone fails (mask touches
+    image border, empty mask, or OpenCV version issue).
+
+    Returns:
+        (H, W, 3) uint8 BGR blended image.
+    """
+    _, mask_binary = cv2.threshold(mask_uint8, 127, 255, cv2.THRESH_BINARY)
+
+    if mask_binary.max() == 0:
+        print("[compositing] WARNING: empty mask in Poisson blend — skipping.")
+        return generated_bgr.copy()
+
+    moments = cv2.moments(mask_binary)
+    if moments["m00"] == 0:
+        H, W   = source_bgr.shape[:2]
+        center = (W // 2, H // 2)
+    else:
+        center = (
+            int(moments["m10"] / moments["m00"]),
+            int(moments["m01"] / moments["m00"]),
+        )
+
+    try:
+        return cv2.seamlessClone(
+            src   = generated_bgr,
+            dst   = source_bgr,
+            mask  = mask_binary,
+            p     = center,
+            flags = cv2.NORMAL_CLONE,
+        )
+    except cv2.error as e:
+        print(
+            f"[compositing] WARNING: seamlessClone failed ({e}). "
+            f"Falling back to alpha blend."
+        )
+        alpha     = mask_uint8.astype(np.float32) / 255.0
+        alpha     = alpha[:, :, np.newaxis]
+        composite = (
+            source_bgr.astype(np.float32)    * (1.0 - alpha) +
+            generated_bgr.astype(np.float32) * alpha
+        )
+        return np.clip(composite, 0, 255).astype(np.uint8)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LF BLEND  (color transfer + alpha blend)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _blend_lf(
+    source_lf:    np.ndarray,   # (H, W, 3) float32 BGR [0, 255]
+    generated_lf: np.ndarray,   # (H, W, 3) float32 BGR [0, 255]
+    mask_uint8:   np.ndarray,   # (H, W) uint8
+) -> np.ndarray:
+    """
+    Blend LF bands:
+        1. Color transfer: match generated_lf color stats to source_lf
+        2. Alpha blend:    final_LF = source × (1-α) + corrected × α
+
+    Color transfer eliminates the skin tone / brightness mismatch
+    that causes the stitched look. Alpha blend then smoothly transitions
+    from source LF to color-corrected generated LF across the mask boundary.
+
+    Returns:
+        final_LF : (H, W, 3) float32 BGR [0, 255]
+    """
+    corrected_lf = _color_transfer_lab(source_lf, generated_lf, mask_uint8)
+
+    alpha    = mask_uint8.astype(np.float32) / 255.0
+    alpha    = alpha[:, :, np.newaxis]
+
+    final_lf = (
+        source_lf.astype(np.float32)    * (1.0 - alpha) +
+        corrected_lf.astype(np.float32) * alpha
+    )
+    return final_lf   # float32 [0, 255]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HF BLEND  (alpha blend + Poisson seam removal)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _blend_hf(
+    source_hf:    np.ndarray,   # (H, W, 3) float32 BGR [-255, 255]
+    generated_hf: np.ndarray,   # (H, W, 3) float32 BGR [-255, 255]
+    mask_uint8:   np.ndarray,   # (H, W) uint8
+) -> np.ndarray:
+    """
+    Blend HF bands:
+        1. Alpha blend on shifted HF
+        2. Poisson blend to remove boundary edge artifacts
+
+    HF is where seams are most visible — hard edges at the mask boundary
+    are immediately noticeable. Poisson blending harmonizes gradients
+    at the boundary so the transition is invisible.
+
+    HF shift: float32 [-255,255] → shift +128 for uint8 ops → shift -128 back.
+
+    Returns:
+        final_HF : (H, W, 3) float32 BGR [-255, 255]
+    """
+    # Shift to [0, 255] for uint8 operations
+    src_u8  = np.clip(source_hf    + 128.0, 0, 255).astype(np.uint8)
+    gen_u8  = np.clip(generated_hf + 128.0, 0, 255).astype(np.uint8)
+
+    # Alpha blend
+    alpha   = mask_uint8.astype(np.float32) / 255.0
+    alpha   = alpha[:, :, np.newaxis]
+    blend   = (
+        src_u8.astype(np.float32) * (1.0 - alpha) +
+        gen_u8.astype(np.float32) * alpha
+    )
+    blend_u8 = np.clip(blend, 0, 255).astype(np.uint8)
+
+    # Poisson blend on the shifted HF
+    poisson_u8 = _poisson_blend(blend_u8, src_u8, mask_uint8)
+
+    # Shift back to [-255, 255]
+    return poisson_u8.astype(np.float32) - 128.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FREQUENCY-DECOMPOSED COMPOSITE  (novel path)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _freq_composite(
+    generated_bgr: np.ndarray,
+    source_bgr:    np.ndarray,
+    mask_uint8:    np.ndarray,
+    source_pil:    Image.Image,
+    generated_pil: Image.Image,
+    cfg:           dict,
+) -> np.ndarray:
+    """
+    Full frequency-decomposed compositing pipeline.
+
+    Steps:
+        1. Decompose source and generated into LF + HF
+           (using the same method as Stage 1 for consistency)
+        2. Blend LF: color transfer → alpha blend
+        3. Blend HF: alpha blend → Poisson seam removal
+        4. Reconstruct: final = clip(final_LF + final_HF)
+
+    Returns:
+        (H, W, 3) uint8 BGR final image.
+    """
+    # Read decomposition params — match Stage 1 settings
+    decomp_method = cfg.get("ablation", {}).get("decomposition", "gaussian")
+    kernel        = cfg.get("stage1",   {}).get("gaussian", {}).get("kernel", 31)
+    sigma         = cfg.get("stage1",   {}).get("gaussian", {}).get("sigma",  5.0)
+    cutoff_ratio  = cfg.get("stage1",   {}).get("fft",      {}).get("cutoff_ratio", 0.1)
+
+    print(f"[compositing] Freq-decomposed blend | method={decomp_method}")
+
+    # ── Step 1: Decompose ─────────────────────────────────────────────────
+    source_LF,    source_HF    = decompose_pil(
+        source_pil,
+        method=decomp_method, kernel=kernel,
+        sigma=sigma, cutoff_ratio=cutoff_ratio,
+    )
+    generated_LF, generated_HF = decompose_pil(
+        generated_pil,
+        method=decomp_method, kernel=kernel,
+        sigma=sigma, cutoff_ratio=cutoff_ratio,
+    )
+
+    print(
+        f"[compositing] Decomposed | "
+        f"src LF [{source_LF.min():.0f},{source_LF.max():.0f}] "
+        f"src HF std={source_HF.std():.2f} | "
+        f"gen LF [{generated_LF.min():.0f},{generated_LF.max():.0f}] "
+        f"gen HF std={generated_HF.std():.2f}"
+    )
+
+    # ── Step 2: Blend LF (color transfer + alpha blend) ───────────────────
+    final_LF = _blend_lf(source_LF, generated_LF, mask_uint8)
+    print("[compositing] LF blend complete (color transfer applied).")
+
+    # ── Step 3: Blend HF (alpha blend + Poisson seam removal) ─────────────
+    final_HF = _blend_hf(source_HF, generated_HF, mask_uint8)
+    print("[compositing] HF blend complete (Poisson seam removal applied).")
+
+    # ── Step 4: Reconstruct ───────────────────────────────────────────────
+    # final_LF : float32 [0, 255]
+    # final_HF : float32 [-255, 255]
+    final = np.clip(final_LF + final_HF, 0, 255).astype(np.uint8)
+
+    print(
+        f"[compositing] Reconstruction complete. "
+        f"Output range [{final.min()}, {final.max()}]"
+    )
+    return final
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FALLBACK: SIMPLE COMPOSITE  (ablation baseline)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _simple_composite(
+    generated_bgr: np.ndarray,
+    source_bgr:    np.ndarray,
+    mask_uint8:    np.ndarray,
+    poisson_blend: bool = True,
+) -> np.ndarray:
+    """
+    Original compositing path: alpha blend + optional Poisson blend.
+
+    Kept as ablation condition (compositing.freq_decomposed: false).
+    Compare directly against freq-decomposed path to isolate the
+    contribution of frequency-aware blending.
+
+    Returns:
+        (H, W, 3) uint8 BGR composited image.
+    """
+    alpha     = mask_uint8.astype(np.float32) / 255.0
+    alpha     = alpha[:, :, np.newaxis]
     composite = (
         source_bgr.astype(np.float32)    * (1.0 - alpha) +
         generated_bgr.astype(np.float32) * alpha
     )
-    return np.clip(composite, 0, 255).astype(np.uint8)
+    composite_u8 = np.clip(composite, 0, 255).astype(np.uint8)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# POISSON BLENDING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _poisson_blend(
-    generated_bgr: np.ndarray,   # (H, W, 3) uint8 — source of interior gradients
-    source_bgr:    np.ndarray,   # (H, W, 3) uint8 — destination (boundary conditions)
-    mask_uint8:    np.ndarray,   # (H, W)    uint8  [0, 255]
-) -> np.ndarray:
-    """
-    Poisson / seamless cloning to remove the color seam at the mask boundary.
-
-    Uses cv2.seamlessClone (NORMAL_CLONE mode) which solves the Poisson
-    equation: preserve gradient structure from `generated_bgr` inside the
-    mask while matching color values from `source_bgr` at the boundary.
-
-    Result: the swapped face has the reference's texture/identity but
-    inherits the source's ambient lighting and color temperature at the edges,
-    making the transition invisible.
-
-    Center point strategy:
-        cv2.seamlessClone requires a center point for the cloned region.
-        We compute the centroid of the mask rather than the image center
-        because the face is not always centered (profile shots, cropped images).
-        Using the mask centroid places the clone kernel optimally.
-
-    Fallback:
-        If seamlessClone fails (e.g., mask is empty, mask touches image border,
-        or OpenCV version limitation), returns the hard composite instead.
-        This ensures the pipeline never crashes on edge cases — it degrades
-        gracefully to the feathered alpha blend.
-
-    Args:
-        generated_bgr : BGR uint8 — the diffusion output (face region).
-        source_bgr    : BGR uint8 — the original source (background).
-        mask_uint8    : (H, W) uint8 mask — face region is non-zero.
-
-    Returns:
-        (H, W, 3) uint8 BGR Poisson-blended image.
-    """
-    # Binarize mask for seamlessClone (it requires 0/255, not gradient values)
-    _, mask_binary = cv2.threshold(mask_uint8, 127, 255, cv2.THRESH_BINARY)
-
-    # Check mask is non-empty
-    if mask_binary.max() == 0:
-        print("[compositing] WARNING: empty mask — returning hard composite.")
-        return _hard_composite(generated_bgr, source_bgr, mask_uint8)
-
-    # Compute mask centroid for the clone center point
-    moments = cv2.moments(mask_binary)
-    if moments["m00"] == 0:
-        # Degenerate mask — fall back to image center
-        H, W = source_bgr.shape[:2]
-        center = (W // 2, H // 2)
-    else:
-        cx = int(moments["m10"] / moments["m00"])
-        cy = int(moments["m01"] / moments["m00"])
-        center = (cx, cy)
-
-    try:
-        blended = cv2.seamlessClone(
-            src=generated_bgr,    # interior gradients come from here
-            dst=source_bgr,       # boundary conditions come from here
-            mask=mask_binary,
-            p=center,
-            flags=cv2.NORMAL_CLONE,
-        )
-        return blended
-
-    except cv2.error as e:
-        # Common cause: mask region touches image border (seamlessClone
-        # requires a margin between mask and image edge).
-        print(
-            f"[compositing] WARNING: seamlessClone failed ({e}). "
-            f"Falling back to feathered alpha composite."
-        )
-        return _hard_composite(generated_bgr, source_bgr, mask_uint8)
+    if poisson_blend:
+        return _poisson_blend(composite_u8, source_bgr, mask_uint8)
+    return composite_u8
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -218,54 +413,48 @@ def _poisson_blend(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def composite_result(
-    generated_pil:    Image.Image,     # PIL RGB — diffusion output
-    source_pil:       Image.Image,     # PIL RGB — original source image
-    face_mask_tensor: torch.Tensor,    # (1, 1, H, W) float32 [0, 1]
+    generated_pil:    Image.Image,
+    source_pil:       Image.Image,
+    face_mask_tensor: torch.Tensor,
     cfg:              dict,
 ) -> Image.Image:
     """
-    Composite the generated face onto the source image using the face mask.
+    Composite the generated face onto the source image.
 
-    This is the main entry point called by stage2_diffusion.py after
-    decode_latent(). It replaces the final return with a composited image
-    that preserves source pixels outside the face region exactly.
+    Reads compositing.freq_decomposed from cfg to select path:
 
-    Pipeline:
-        1. Prepare mask — resize to output size, feather edges
-        2. Convert PIL images to BGR numpy arrays
-        3. Hard composite — alpha blend using feathered mask
-        4. Poisson blend  — seam removal at mask boundary (if enabled)
-        5. Convert back to PIL RGB
+        freq_decomposed: true  (default — novel method)
+            decompose both images into LF + HF
+            blend LF with color transfer  → fixes skin tone mismatch
+            blend HF with Poisson         → fixes boundary seam
+            reconstruct: final = LF + HF
 
-    Config reads:
-        cfg["compositing"]["poisson_blend"]  (bool)
-            true  → apply Poisson seamless cloning after hard composite (default)
-            false → return feathered hard composite only (debug / ablation)
+        freq_decomposed: false  (ablation baseline)
+            alpha blend + optional Poisson blend (original behavior)
 
-        cfg["compositing"]["feather_px"]  (int, default 8)
-            Gaussian blur radius for mask edge feathering.
-            0 = hard binary mask (useful to verify mask boundary visually).
+    Config keys:
+        compositing.freq_decomposed  bool  default True
+        compositing.poisson_blend    bool  default True
+        compositing.feather_px       int   default 8
 
     Args:
-        generated_pil    : PIL RGB output from decode_latent().
-                           Same size as source_pil (both at target_size).
-        source_pil       : PIL RGB original source image from artifacts/.
-        face_mask_tensor : (1, 1, H, W) float32 mask from artifacts/face_mask.pt.
+        generated_pil    : PIL RGB diffusion output from decode_latent().
+        source_pil       : PIL RGB original source from artifacts/.
+        face_mask_tensor : (1,1,H,W) float32 [0,1] from artifacts/face_mask.pt.
         cfg              : Full resolved config dict.
 
     Returns:
-        PIL RGB image — reference face composited onto source background.
-        Size matches generated_pil and source_pil.
+        PIL RGB — reference face on source background, no stitching.
     """
-    # ── Read compositing config ────────────────────────────────────────────
-    comp_cfg      = cfg.get("compositing", {})
-    poisson_blend = comp_cfg.get("poisson_blend", True)
-    feather_px    = comp_cfg.get("feather_px", 8)
+    comp_cfg        = cfg.get("compositing", {})
+    freq_decomposed = comp_cfg.get("freq_decomposed", True)
+    poisson_blend   = comp_cfg.get("poisson_blend",   True)
+    feather_px      = comp_cfg.get("feather_px",      8)
 
-    # ── Validate sizes match ───────────────────────────────────────────────
+    # Size check
     if generated_pil.size != source_pil.size:
         print(
-            f"[compositing] WARNING: size mismatch — "
+            f"[compositing] WARNING: size mismatch "
             f"generated={generated_pil.size} source={source_pil.size}. "
             f"Resizing generated to match source."
         )
@@ -273,27 +462,32 @@ def composite_result(
 
     target_size = source_pil.size   # (W, H)
 
-    # ── 1. Prepare mask ────────────────────────────────────────────────────
+    # Prepare mask
     mask_uint8 = _prepare_mask(face_mask_tensor, target_size, feather_px)
 
-    # ── 2. PIL RGB → BGR numpy ─────────────────────────────────────────────
+    # PIL RGB → BGR numpy
     generated_bgr = cv2.cvtColor(np.array(generated_pil), cv2.COLOR_RGB2BGR)
     source_bgr    = cv2.cvtColor(np.array(source_pil),    cv2.COLOR_RGB2BGR)
 
-    # ── 3. Hard composite (alpha blend with feathered mask) ────────────────
-    composite_bgr = _hard_composite(generated_bgr, source_bgr, mask_uint8)
-
-    # ── 4. Poisson blend (seam removal at boundary) ────────────────────────
-    if poisson_blend:
-        # Pass the hard composite as the source so Poisson blending
-        # smooths the boundary of an already-reasonable composite.
-        # Passing raw generated_bgr directly can over-correct if the
-        # generated image has large global color shift.
-        final_bgr = _poisson_blend(composite_bgr, source_bgr, mask_uint8)
+    # Select compositing path
+    if freq_decomposed:
+        print("[compositing] Mode: frequency-decomposed (novel method)")
+        final_bgr = _freq_composite(
+            generated_bgr = generated_bgr,
+            source_bgr    = source_bgr,
+            mask_uint8    = mask_uint8,
+            source_pil    = source_pil,
+            generated_pil = generated_pil,
+            cfg           = cfg,
+        )
     else:
-        final_bgr = composite_bgr
-        print("[compositing] Poisson blending disabled — returning hard composite.")
+        print("[compositing] Mode: simple composite (ablation baseline)")
+        final_bgr = _simple_composite(
+            generated_bgr = generated_bgr,
+            source_bgr    = source_bgr,
+            mask_uint8    = mask_uint8,
+            poisson_blend = poisson_blend,
+        )
 
-    # ── 5. BGR numpy → PIL RGB ─────────────────────────────────────────────
     final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(final_rgb)

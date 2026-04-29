@@ -41,10 +41,10 @@ stage1:
 
   # SAM segmentation (used when ablation.mask_type = "sam")
   sam:
-    points_per_side:      32
-    pred_iou_thresh:      0.88
+    points_per_side:        32
+    pred_iou_thresh:        0.88
     stability_score_thresh: 0.95
-    prompt_strategy:      "nose_tip"    # "nose_tip" | "bbox" | "eye_center"
+    prompt_strategy:        "nose_tip"    # "nose_tip" | "bbox" | "eye_center"
     # nose_tip   → uses MediaPipe landmark index 4 as point prompt
     # bbox       → uses bounding box from landmark extents
     # eye_center → uses midpoint between both eye centers
@@ -87,6 +87,47 @@ injection:
       - "up_blocks.3"
 
 
+# ── Compositing ───────────────────────────────────────────────
+# Controls how the diffusion output is composited back onto the source.
+# This is where frequency decomposition extends into the compositing stage,
+# making freq decomp end-to-end across the full pipeline (novel contribution).
+compositing:
+
+  # A7 — Frequency-decomposed compositing (novel method)
+  # true  : split source + generated into LF + HF, blend each band separately
+  #           LF blend → color transfer (LAB Reinhard) + alpha blend
+  #                       fixes skin tone / color temperature mismatch
+  #           HF blend → alpha blend + Poisson seam removal
+  #                       fixes boundary edge artifacts
+  #           reconstruct: final = final_LF + final_HF
+  # false : simple alpha blend + optional Poisson blend (ablation baseline)
+  #           same behavior as original compositing.py
+  #           use this to isolate the contribution of freq-decomposed blending
+  freq_decomposed: true
+
+  # Poisson seamless cloning at the mask boundary.
+  # true  : cv2.seamlessClone removes the color seam at the boundary
+  #         (used in both freq_decomposed and simple paths)
+  # false : skip Poisson — returns alpha blend only (debug mode)
+  #         set false to verify mask boundary is correct before blending hides it
+  poisson_blend: true
+
+  # Gaussian blur radius for mask edge feathering (pixels).
+  # Softens the hard binary mask boundary before blending.
+  # 0  = hard binary mask (shows exact SAM boundary — useful for debugging)
+  # 8  = default, softens ~16px boundary region
+  # 16 = wider feather for large pose differences or rough mask edges
+  feather_px: 8
+
+  # Width of the boundary ring used for seam blending (pixels).
+  # The boundary ring = face_mask eroded by boundary_width subtracted from face_mask.
+  # This ring is where Poisson blending focuses its gradient harmonization.
+  # 20 = default, covers ~20px around the mask edge
+  # Increase if seam is still visible after compositing.
+  # Decrease if boundary blending is leaking into the face interior.
+  boundary_width: 20
+
+
 # ── Ablation flags ───────────────────────────────────────────
 # Change ONE flag at a time for a clean ablation study.
 ablation:
@@ -119,11 +160,35 @@ ablation:
   # "phase2" : naive baseline — single aligned reference, no freq split, flat lambdas
   mode: "phase3"
 
+  # A7 — Compositing method (mirrors compositing.freq_decomposed above)
+  # Kept here as well so ablation_runner.py can sweep it alongside other flags
+  # without reading the compositing section separately.
+  # "freq"   : frequency-decomposed compositing (novel — default)
+  # "simple" : alpha blend + Poisson only (baseline)
+  compositing: "freq"
+
+  # A8 — Injection mode
+  # "chimera" : source_LF + aligned_HF pre-fused, single store pass (proposed)
+  # "split"   : separate LF and HF store passes (old phase3 behaviour)
+  injection_mode: "chimera"
+
 
 # ── Ablation sweep config (used by ablation/ablation_runner.py) ──────
 # Define all conditions to sweep. Runner creates one output per condition.
 ablation_sweep:
   injection_scale: [0.3, 0.5, 0.8, 1.0]   # A6 — injection strength sensitivity
+
+  # Full 2x2 compositing ablation:
+  #   freq_decomposed_injection × freq_decomposed_compositing
+  #   Condition 1: injection=kv,     compositing=simple  (injection only)
+  #   Condition 2: injection=kv,     compositing=freq    (both — full method)
+  #   Condition 3: injection=phase2, compositing=simple  (neither)
+  #   Condition 4: injection=phase2, compositing=freq    (compositing only)
+  compositing_conditions:
+    - { ablation_mode: "phase2", compositing: "simple" }   # baseline
+    - { ablation_mode: "phase2", compositing: "freq"   }   # freq compositing only
+    - { ablation_mode: "phase3", compositing: "simple" }   # freq injection only
+    - { ablation_mode: "phase3", compositing: "freq"   }   # full method
 
   # Pose robustness bucketing (used for reporting, not for running)
   yaw_buckets:
@@ -137,11 +202,3 @@ logging:
   save_intermediates: false   # save LF/HF/aligned images alongside final result
   verbose:            true    # print per-step cache summary
   save_meta:          true    # write meta.json to artifacts/ after stage1
-
-compositing:
-  poisson_blend: true   # true = Poisson seamless clone (removes seam)
-                        # false = feathered alpha blend only (debug mode)
-  feather_px: 8         # Gaussian blur radius for mask edge softening.
-                        # 0 = hard binary mask (shows exact mask boundary).
-                        # 8 = default, softens ~16px boundary region.
-                        # Increase if seam is still visible after Poisson.

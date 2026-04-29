@@ -62,6 +62,7 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
+from core.decomposition import build_chimera
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 # Support running from project root OR from inside the project directory.
@@ -358,6 +359,7 @@ def step_convert(cfg: dict, decomp_result, aligned_face: np.ndarray,
         aligned_pil      : PIL RGB (target_size × target_size)
         lf_pil           : PIL RGB (target_size × target_size)
         hf_pil           : PIL RGB (target_size × target_size)  HF shifted to [0,255]
+        chimera_pil      : PIL RGB (target_size × target_size)  source_LF + aligned_HF
         face_mask_tensor : (1, 1, target_size, target_size) float32 [0,1]
     """
     target_size = cfg["image"]["target_size"]
@@ -375,6 +377,20 @@ def step_convert(cfg: dict, decomp_result, aligned_face: np.ndarray,
         (target_size, target_size), Image.LANCZOS
     )
 
+    # ── Chimera: source_LF + aligned_HF ──────────────────────────────────
+    chimera_bgr = build_chimera(
+        source_bgr   = source_bgr,
+        aligned_bgr  = aligned_face,
+        method       = cfg["ablation"]["decomposition"],
+        kernel       = cfg["stage1"]["gaussian"]["kernel"],
+        sigma        = cfg["stage1"]["gaussian"]["sigma"],
+        cutoff_ratio = cfg["stage1"]["fft"]["cutoff_ratio"],
+    )
+    chimera_rgb = cv2.cvtColor(chimera_bgr, cv2.COLOR_BGR2RGB)
+    chimera_pil = Image.fromarray(chimera_rgb).resize(
+        (target_size, target_size), Image.LANCZOS
+    )
+
     print(
         f"[stage1] Conversion done | "
         f"PIL size={source_pil.size} | "
@@ -382,7 +398,7 @@ def step_convert(cfg: dict, decomp_result, aligned_face: np.ndarray,
         f"range=[{face_mask_tensor.min():.2f}, {face_mask_tensor.max():.2f}]"
     )
 
-    return source_pil, aligned_pil, lf_pil, hf_pil, face_mask_tensor
+    return source_pil, aligned_pil, lf_pil, hf_pil, chimera_pil, face_mask_tensor
 
 
 def step_save(cfg: dict, source_pil, aligned_pil, lf_pil, hf_pil,
@@ -408,6 +424,7 @@ def step_save(cfg: dict, source_pil, aligned_pil, lf_pil, hf_pil,
         "hf_pil.png"      : ("pil",    hf_pil),
         "face_mask.pt"    : ("tensor", face_mask_tensor),
         "meta.json"       : ("json",   meta),
+        "chimera_pil.png" : ("pil", chimera_pil),
     }
 
     print(f"\n[stage1] Saving artifacts → {os.path.abspath(artifacts_dir)}/")
