@@ -610,13 +610,13 @@ def save_results(
     # ── Comparison panel ───────────────────────────────────────────────────
     # 4 panels side-by-side: Source | Aligned Ref | LF component | Result
     # Makes it easy to visually verify each stage of the pipeline at a glance.
-    panels      = [
-        artifacts["source_pil"],
-        artifacts["aligned_pil"],
-        artifacts["lf_pil"],
-        result_pil,
+    panels = [
+    artifacts["source_pil"],
+    artifacts["aligned_pil"],
+    artifacts["chimera_pil"],
+    result_pil,
     ]
-    labels      = ["Source", "Aligned Ref", "LF (structure)", f"Result ({mode})"]
+    labels = ["Source", "Aligned Ref", "Chimera (src_LF + ref_HF)", f"Result ({mode})"]
     W, H        = panels[0].size
     pad         = 4
     label_h     = 20
