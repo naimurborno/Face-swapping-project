@@ -1,24 +1,30 @@
 # stage1_segment.py
 """
-Stage 1 — Face alignment, segmentation, and frequency decomposition.
+Stage 1 — Donor alignment, segmentation, and mixed-frequency prior construction.
 
-Entry point for the first stage of the face swap pipeline.
-Reads configs/default.yaml, runs the full Stage 1 pipeline, and saves
-all artifacts to the artifacts/ directory for Stage 2 to consume.
+Entry point for the first stage of the Mixed-Frequency Prior Guided Inpainting
+pipeline. Reads configs/default.yaml, runs all Stage 1 steps, and saves every
+artifact the diffusion stage needs into the artifacts/ directory.
 
 Pipeline steps (in order):
-    1. Load source + reference images from disk
-    2. MediaPipe landmark detection on both images
-    3. Affine alignment: warp reference → source pose
-    4. Face mask: SAM / convex_hull / none  (ablation.mask_type)
-    5. Frequency decomposition of aligned reference  (ablation.decomposition)
-    6. Format conversion: numpy BGR → PIL RGB + mask tensor
-    7. Save all artifacts to artifacts/
+    1. Load content + donor images from disk
+    2. Align donor to content spatial coordinate system
+    3. Object mask: SAM / none  (ablation.mask_type)
+    4. Frequency decomposition of both content and aligned donor
+    5. Build mixed-frequency prior  P = α·S_LF + β·R̃_LF + γ·R̃_HF
+    6. Embed prior into masked input  X₀ = (1−M)⊙S + M⊙P
+    7. Format conversion: numpy BGR → PIL RGB + mask tensor
+    8. Save all artifacts to artifacts/
 
 After this script completes:
-    - Stage 2 can be run immediately (pipe loads diffusion model fresh)
+    - Stage 2 (stage2_diffusion.py) can be run immediately
     - SAM is fully unloaded from memory before this script exits
-    - Artifacts contain everything Stage 2 needs — no images needed at runtime
+    - Artifacts contain everything Stage 2 needs — no original images required
+      at diffusion time
+
+The key artifact produced here is masked_input.png  (X₀): the content image
+with the mixed-frequency prior embedded inside the mask region. This is what
+the inpainting model receives as its starting point.
 
 Usage:
     # Default config:
@@ -28,26 +34,28 @@ Usage:
     python stage1_segment.py --config configs/my_experiment.yaml
 
     # Override specific values without editing the yaml:
-    python stage1_segment.py --mask-type convex_hull
+    python stage1_segment.py --mask-type none
     python stage1_segment.py --decomp fft
-    python stage1_segment.py --source inputs/alice.jpg --reference inputs/bob.jpg
+    python stage1_segment.py --content inputs/wall.jpg --donor inputs/marble.jpg
+    python stage1_segment.py --alpha 0.7 --beta 0.4 --gamma 0.9
 
     # Dry run — prints resolved config and exits without running:
     python stage1_segment.py --dry-run
 
-Output (all in artifacts/ by default):
-    source_pil.png    — source image resized to target_size, RGB
-    aligned_pil.png   — reference warped into source pose, resized
-    lf_pil.png        — LF component of aligned reference, resized
-    hf_pil.png        — HF component shifted to [0,255], resized
-    face_mask.pt      — (1,1,S,S) float32 mask tensor for KVCache.face_mask
-    meta.json         — all parameters + stats, read by Stage 2 at startup
+Output (all saved to artifacts/ by default):
+    content_pil.png       — content image S resized to target_size, RGB
+    donor_aligned_pil.png — donor R̃ aligned to content, resized, RGB
+    s_lf_pil.png          — S_LF (content low-frequency component), RGB
+    r_hf_pil.png          — R̃_HF shifted to [0,255] for visualization, RGB
+    prior_pil.png         — prior P (the mixed signal inside the mask), RGB
+    masked_input_pil.png  — X₀ = (1−M)⊙S + M⊙P  (inpainting model input), RGB
+    object_mask.pt        — (1, 1, S, S) float32 mask tensor for shallow KV gating + blended latent anchoring
+    meta.json             — all parameters + stats, read by Stage 2 at startup
 
 Dependencies:
-    pip install mediapipe opencv-python-headless torch pillow pyyaml
+    pip install opencv-python-headless torch pillow pyyaml numpy
     pip install git+https://github.com/facebookresearch/segment-anything.git
-    Download face_landmarker.task (see README)
-    Download SAM checkpoint (see README)
+    Download SAM checkpoint (see README for links)
 """
 
 import sys
@@ -62,7 +70,6 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
-from core.decomposition import build_chimera
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 # Support running from project root OR from inside the project directory.
@@ -71,13 +78,17 @@ _CORE = os.path.join(_HERE, "core")
 if os.path.isdir(_CORE):
     sys.path.insert(0, _CORE)
 else:
-    # Fallback: assume core modules are in the same directory
     sys.path.insert(0, _HERE)
 
 try:
-    from alignment import run_alignment
-    from segmentation import load_sam_model, get_face_mask
-    from decomposition import decompose, to_pil_inputs, mask_to_tensor
+    from alignment   import run_donor_alignment, AlignmentResult
+    from segmentation import load_sam_model, get_object_mask, mask_to_tensor
+    from decomposition import (
+        decompose,
+        build_prior,
+        prior_result_to_pil,
+        PriorResult,
+    )
 except ImportError as e:
     print(f"\n[stage1] FATAL — could not import core modules: {e}")
     print("  Make sure core/ exists and contains alignment.py, segmentation.py,")
@@ -114,42 +125,64 @@ def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
     Apply CLI argument overrides on top of the loaded config.
 
     Only overrides keys that were explicitly provided on the command line
-    (i.e. not None). This lets you run ablations without editing the yaml:
-        python stage1_segment.py --mask-type convex_hull --decomp fft
+    (i.e. not None). This allows ablations without editing the yaml:
+        python stage1_segment.py --mask-type none --decomp fft --alpha 0.8
     """
-    if args.source is not None:
-        cfg["paths"]["source_image"] = args.source
-    if args.reference is not None:
-        cfg["paths"]["reference_image"] = args.reference
+    # ── Paths ─────────────────────────────────────────────────────────────
+    if args.content is not None:
+        cfg["paths"]["content_image"] = args.content
+    if args.donor is not None:
+        cfg["paths"]["donor_image"] = args.donor
     if args.artifacts_dir is not None:
         cfg["paths"]["artifacts_dir"] = args.artifacts_dir
-    if args.landmark_model is not None:
-        cfg["paths"]["landmark_model"] = args.landmark_model
     if args.sam_checkpoint is not None:
         cfg["paths"]["sam_checkpoint"] = args.sam_checkpoint
     if args.sam_type is not None:
         cfg["paths"]["sam_model_type"] = args.sam_type
+
+    # ── Ablation / method overrides ────────────────────────────────────────
     if args.mask_type is not None:
         cfg["ablation"]["mask_type"] = args.mask_type
     if args.decomp is not None:
         cfg["ablation"]["decomposition"] = args.decomp
+    if args.align_method is not None:
+        cfg["alignment"]["method"] = args.align_method
+
+    # ── Prior coefficients ─────────────────────────────────────────────────
+    if args.alpha is not None:
+        cfg["prior"]["alpha"] = args.alpha
+    if args.beta is not None:
+        cfg["prior"]["beta"] = args.beta
+    if args.gamma is not None:
+        cfg["prior"]["gamma"] = args.gamma
+
+    # ── Image ──────────────────────────────────────────────────────────────
     if args.target_size is not None:
         cfg["image"]["target_size"] = args.target_size
+
     return cfg
 
 
 def print_config(cfg: dict):
-    """Print the resolved config that will actually be used."""
+    """Print the fully resolved config that will actually be used."""
     print("\n┌─ Resolved config ─────────────────────────────────────────")
-    print(f"│  source_image   : {cfg['paths']['source_image']}")
-    print(f"│  reference_image: {cfg['paths']['reference_image']}")
+    print(f"│  content_image  : {cfg['paths']['content_image']}")
+    print(f"│  donor_image    : {cfg['paths']['donor_image']}")
     print(f"│  artifacts_dir  : {cfg['paths']['artifacts_dir']}")
-    print(f"│  landmark_model : {cfg['paths']['landmark_model']}")
     print(f"│  target_size    : {cfg['image']['target_size']}px")
+    print(f"│")
+    print(f"│  [prior]")
+    print(f"│  alpha          : {cfg['prior']['alpha']}  (content LF weight)")
+    print(f"│  beta           : {cfg['prior']['beta']}  (donor LF weight)")
+    print(f"│  gamma          : {cfg['prior']['gamma']}  (donor HF weight)")
+    print(f"│  histogram_match: {cfg['prior']['histogram_match']}")
     print(f"│")
     print(f"│  [ablation]")
     print(f"│  mask_type      : {cfg['ablation']['mask_type']}")
     print(f"│  decomposition  : {cfg['ablation']['decomposition']}")
+    print(f"│")
+    print(f"│  [alignment]")
+    print(f"│  method         : {cfg['alignment']['method']}")
     print(f"│")
     if cfg["ablation"]["mask_type"] == "sam":
         print(f"│  [SAM]")
@@ -159,11 +192,11 @@ def print_config(cfg: dict):
         print(f"│  pred_iou_thresh: {cfg['stage1']['sam']['pred_iou_thresh']}")
         print(f"│")
     if cfg["ablation"]["decomposition"] == "gaussian":
-        print(f"│  [Gaussian]")
+        print(f"│  [Gaussian decomposition]")
         print(f"│  kernel         : {cfg['stage1']['gaussian']['kernel']}")
         print(f"│  sigma          : {cfg['stage1']['gaussian']['sigma']}")
     elif cfg["ablation"]["decomposition"] == "fft":
-        print(f"│  [FFT]")
+        print(f"│  [FFT decomposition]")
         print(f"│  cutoff_ratio   : {cfg['stage1']['fft']['cutoff_ratio']}")
     print(f"└───────────────────────────────────────────────────────────\n")
 
@@ -175,92 +208,108 @@ def print_config(cfg: dict):
 
 def step_load_images(cfg: dict):
     """
-    Step 1: Load source and reference images from disk.
+    Step 1: Load content and donor images from disk.
+
+    Both images are read as-is (any resolution). Resizing to target_size
+    happens later in step_convert() so all intermediate operations work
+    at original resolution.
 
     Returns:
-        source_bgr    : (H, W, 3) uint8 BGR
-        reference_bgr : (H, W, 3) uint8 BGR
+        content_bgr : (H_c, W_c, 3) uint8 BGR — content image S
+        donor_bgr   : (H_d, W_d, 3) uint8 BGR — donor image R
     """
-    src_path = cfg["paths"]["source_image"]
-    ref_path = cfg["paths"]["reference_image"]
+    content_path = cfg["paths"]["content_image"]
+    donor_path   = cfg["paths"]["donor_image"]
 
-    for label, path in [("source", src_path), ("reference", ref_path)]:
+    for label, path, flag in [
+        ("content", content_path, "--content"),
+        ("donor",   donor_path,   "--donor"),
+    ]:
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"[stage1] {label} image not found: {path}\n"
                 f"  Update paths.{label}_image in configs/default.yaml\n"
-                f"  or pass --{'source' if label == 'source' else 'reference'} <path>"
+                f"  or pass {flag} <path>"
             )
 
-    source_bgr    = cv2.imread(src_path)
-    reference_bgr = cv2.imread(ref_path)
+    content_bgr = cv2.imread(content_path)
+    donor_bgr   = cv2.imread(donor_path)
 
-    if source_bgr is None:
-        raise ValueError(f"[stage1] cv2.imread failed for source: {src_path}")
-    if reference_bgr is None:
-        raise ValueError(f"[stage1] cv2.imread failed for reference: {ref_path}")
+    if content_bgr is None:
+        raise ValueError(f"[stage1] cv2.imread failed for content: {content_path}")
+    if donor_bgr is None:
+        raise ValueError(f"[stage1] cv2.imread failed for donor: {donor_path}")
 
-    print(f"[stage1] Source   : {src_path}  ({source_bgr.shape[1]}×{source_bgr.shape[0]}px)")
-    print(f"[stage1] Reference: {ref_path}  ({reference_bgr.shape[1]}×{reference_bgr.shape[0]}px)")
+    print(f"[stage1] Content : {content_path}  ({content_bgr.shape[1]}×{content_bgr.shape[0]}px)")
+    print(f"[stage1] Donor   : {donor_path}  ({donor_bgr.shape[1]}×{donor_bgr.shape[0]}px)")
 
-    return source_bgr, reference_bgr
+    return content_bgr, donor_bgr
 
 
-def step_align(cfg: dict, source_bgr: np.ndarray, reference_bgr: np.ndarray):
+def step_align(cfg: dict, content_bgr: np.ndarray, donor_bgr: np.ndarray) -> AlignmentResult:
     """
-    Step 2+3: MediaPipe detection on both images + affine warp.
+    Step 2: Align donor image into content image's spatial coordinate system.
+
+    The aligned donor R̃ has the same spatial dimensions as the content image S.
+    This is required because build_prior() computes P = α·S_LF + β·R̃_LF + γ·R̃_HF
+    pixel-by-pixel — misaligned inputs produce a spatially incoherent prior that
+    the inpainting model will treat as noise and ignore.
+
+    Method is read from cfg["alignment"]["method"]:
+        "resize"  — simple resize, default, no extra dependencies
+        "tile"    — tile donor to fill content canvas (for tileable textures)
+        "match"   — ORB feature matching + affine RANSAC
+        "flow"    — dense optical flow warp (Farneback)
+        "affine"  — explicit affine from user-supplied point pairs
 
     Returns:
-        alignment_result : AlignmentResult (src_result, aligned_face, yaw_diff, ...)
+        AlignmentResult with aligned_donor (BGR), method_used, fallback, meta
     """
-    mp_cfg         = cfg["stage1"]["mediapipe"]
-    landmark_model = cfg["paths"]["landmark_model"]
+    method     = cfg["alignment"]["method"]
+    content_hw = content_bgr.shape[:2]   # (H, W)
 
-    if not os.path.exists(landmark_model):
-        raise FileNotFoundError(
-            f"[stage1] MediaPipe model not found: {landmark_model}\n"
-            "  Download with:\n"
-            "  wget -O face_landmarker.task https://storage.googleapis.com/"
-            "mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-        )
-
-    alignment_result = run_alignment(
-        source_bgr    = source_bgr,
-        reference_bgr = reference_bgr,
-        model_path    = landmark_model,
-        min_face_detection_confidence = mp_cfg["min_face_detection_confidence"],
-        min_face_presence_confidence  = mp_cfg["min_face_presence_confidence"],
-        max_yaw_warning_deg           = mp_cfg["max_yaw_warning_deg"],
+    alignment_result = run_donor_alignment(
+        donor_bgr   = donor_bgr,
+        content_bgr = content_bgr,
+        method      = method,
     )
 
+    fallback_note = "  [fallback]" if alignment_result.fallback else ""
     print(
         f"[stage1] Alignment done | "
-        f"yaw_diff={alignment_result.yaw_diff:.1f}°  "
-        f"{'✓ ok' if alignment_result.yaw_diff <= mp_cfg['max_yaw_warning_deg'] else '⚠ large — warp may degrade'}"
+        f"method={alignment_result.method_used}{fallback_note} | "
+        f"donor → content: {donor_bgr.shape[1]}×{donor_bgr.shape[0]}px "
+        f"→ {content_hw[1]}×{content_hw[0]}px"
     )
+    if alignment_result.meta:
+        for k, v in alignment_result.meta.items():
+            print(f"           {k}: {v}")
 
     return alignment_result
 
 
-def step_mask(cfg: dict, source_bgr: np.ndarray, src_lm) -> np.ndarray:
+def step_mask(cfg: dict, content_bgr: np.ndarray) -> np.ndarray:
     """
-    Step 4: Produce the face mask for the source image.
+    Step 3: Produce the binary object mask for the content image.
+
+    The mask defines exactly two regions:
+        mask=255  — editable region: mixed-frequency prior is applied here;
+                    diffusion fills this area guided by the prior + shallow KV.
+        mask=0    — frozen region: blended latent anchoring guarantees this
+                    region is pixel-identical to the content image in the output.
 
     mask_type is read from ablation.mask_type:
-        "sam"         → load SAM, run with MediaPipe point prompt, delete SAM
-        "convex_hull" → convex hull of 68 landmarks, dilated
-        "none"        → full-image mask (global injection, no spatial gating)
+        "sam"  → SAM segmentation with center_point or bbox prompt (default)
+        "none" → full-image mask — entire image is editable (ablation baseline)
 
-    SAM is loaded and deleted inside this function so its VRAM is free
-    before Stage 2 loads the diffusion model.
+    SAM is loaded, used, and immediately deleted inside this function so its
+    VRAM is free before Stage 2 loads the inpainting diffusion model.
 
     Returns:
-        face_mask_uint8 : (H, W) uint8, values 0/255
+        object_mask_uint8 : (H, W) uint8, values 0/255
     """
     mask_type = cfg["ablation"]["mask_type"]
     sam_cfg   = cfg["stage1"]["sam"]
-    ch_cfg    = cfg["stage1"]["convex_hull"]
-
     predictor = None
 
     if mask_type == "sam":
@@ -275,8 +324,8 @@ def step_mask(cfg: dict, source_bgr: np.ndarray, src_lm) -> np.ndarray:
                 f"  Download SAM checkpoints from:\n"
                 f"  https://github.com/facebookresearch/segment-anything#model-checkpoints\n"
                 f"\n"
-                f"  To skip SAM entirely, use ablation.mask_type: convex_hull\n"
-                f"  or pass --mask-type convex_hull"
+                f"  To skip SAM, use ablation.mask_type: none\n"
+                f"  or pass --mask-type none"
             )
 
         predictor = load_sam_model(
@@ -284,16 +333,14 @@ def step_mask(cfg: dict, source_bgr: np.ndarray, src_lm) -> np.ndarray:
             model_type      = sam_model_type,
         )
 
-    face_mask_uint8 = get_face_mask(
-        image_bgr               = source_bgr,
-        lm_result               = src_lm,
-        mask_type               = mask_type,
-        predictor               = predictor,
-        prompt_strategy         = sam_cfg["prompt_strategy"],
-        pred_iou_thresh         = sam_cfg["pred_iou_thresh"],
-        stability_score_thresh  = sam_cfg["stability_score_thresh"],
-        dilation_px             = 0,                      # SAM mask is already precise
-        convex_hull_dilation_px = ch_cfg["dilation_px"],
+    object_mask_uint8 = get_object_mask(
+        image_bgr              = content_bgr,
+        mask_type              = mask_type,
+        predictor              = predictor,
+        prompt_strategy        = sam_cfg["prompt_strategy"],
+        pred_iou_thresh        = sam_cfg["pred_iou_thresh"],
+        stability_score_thresh = sam_cfg["stability_score_thresh"],
+        dilation_px            = sam_cfg.get("dilation_px", 0),
     )
 
     # Free SAM from GPU memory immediately — Stage 2 needs that VRAM
@@ -303,128 +350,243 @@ def step_mask(cfg: dict, source_bgr: np.ndarray, src_lm) -> np.ndarray:
             torch.cuda.empty_cache()
         print("[stage1] SAM predictor deleted — VRAM freed for Stage 2")
 
-    coverage = float(face_mask_uint8.astype(bool).mean() * 100)
+    coverage = float(object_mask_uint8.astype(bool).mean() * 100)
     print(
         f"[stage1] Mask ready | "
         f"mask_type={mask_type} | "
         f"coverage={coverage:.1f}%  "
-        f"{'✓' if 5.0 < coverage < 80.0 else '⚠ unusual coverage — check mask quality'}"
+        f"{'✓' if 5.0 < coverage < 95.0 else '⚠ unusual coverage — check mask quality'}"
     )
 
-    return face_mask_uint8
+    return object_mask_uint8
 
 
-def step_decompose(cfg: dict, aligned_face: np.ndarray):
+def step_decompose(cfg: dict, content_bgr: np.ndarray, donor_aligned_bgr: np.ndarray):
     """
-    Step 5: Frequency decomposition of the aligned reference face.
+    Step 4: Frequency decompose both content S and aligned donor R̃.
 
-    method is read from ablation.decomposition:
-        "gaussian" → Gaussian blur split (default, no ringing)
-        "fft"      → FFT rectangular mask split (ablation)
-        "none"     → whole image used as both LF and HF (Phase 2 equivalent)
+    Produces four frequency bands:
+        S_LF  — content low-frequency:  coarse geometry, depth gradients,
+                 illumination field. Governs spatial structure in the prior.
+        S_HF  — content high-frequency: fine surface detail of S (not used
+                 in prior construction, kept for logging and ablation A1).
+        R̃_LF  — donor low-frequency:   coarse material color and tone.
+                 Contributes donor semantic appearance to the prior.
+        R̃_HF  — donor high-frequency:  fine surface detail, texture,
+                 microstructure. The primary transfer signal.
+
+    The separation method (Gaussian / FFT / none) is read from
+    ablation.decomposition and applied identically to both images so their
+    frequency bands are computed at the same cutoff frequency.
 
     Returns:
-        decomp_result : DecomposeResult(LF, HF, method, lf_energy, hf_std)
+        content_decomp : DecomposeResult for S  (S_LF, S_HF, method, stats)
+        donor_decomp   : DecomposeResult for R̃  (R̃_LF, R̃_HF, method, stats)
     """
-    method       = cfg["ablation"]["decomposition"]
-    gauss_cfg    = cfg["stage1"]["gaussian"]
-    fft_cfg      = cfg["stage1"]["fft"]
+    method    = cfg["ablation"]["decomposition"]
+    gauss_cfg = cfg["stage1"]["gaussian"]
+    fft_cfg   = cfg["stage1"]["fft"]
 
-    decomp_result = decompose(
-        aligned_bgr  = aligned_face,
+    decomp_kwargs = dict(
         method       = method,
         kernel       = gauss_cfg["kernel"],
         sigma        = gauss_cfg["sigma"],
         cutoff_ratio = fft_cfg["cutoff_ratio"],
     )
 
+    content_decomp = decompose(aligned_bgr=content_bgr,   **decomp_kwargs)
+    donor_decomp   = decompose(aligned_bgr=donor_aligned_bgr, **decomp_kwargs)
+
     print(
-        f"[stage1] Decomposition done | "
-        f"method={method} | "
-        f"LF_energy={decomp_result.lf_energy:.1f} | "
-        f"HF_std={decomp_result.hf_std:.2f}  "
-        f"{'✓' if decomp_result.hf_std > 10 else '⚠ low HF std — check image texture'}"
+        f"[stage1] Decomposition done | method={method}\n"
+        f"         Content : LF_energy={content_decomp.lf_energy:.1f}  "
+        f"HF_std={content_decomp.hf_std:.2f}"
+        f"  {'✓' if content_decomp.hf_std > 5 else '⚠ low HF — flat content?'}\n"
+        f"         Donor   : LF_energy={donor_decomp.lf_energy:.1f}  "
+        f"HF_std={donor_decomp.hf_std:.2f}"
+        f"  {'✓' if donor_decomp.hf_std > 5 else '⚠ low HF — flat donor?'}"
     )
 
-    return decomp_result
+    return content_decomp, donor_decomp
 
 
-def step_convert(cfg: dict, decomp_result, aligned_face: np.ndarray,
-                 face_mask_uint8: np.ndarray, source_bgr: np.ndarray):
+def step_build_prior(
+    cfg:               dict,
+    content_bgr:       np.ndarray,
+    donor_aligned_bgr: np.ndarray,
+    object_mask_uint8: np.ndarray,
+) -> "PriorResult":
     """
-    Step 6: Convert all numpy outputs to pipeline-ready formats.
+    Step 5: Build the mixed-frequency prior P and embed it into X₀.
+
+    Prior construction:
+        P_raw = α·S_LF + β·R̃_LF + γ·R̃_HF
+        P     = histogram_match(P_raw, S_masked)   # photometric plausibility
+        X₀    = (1−M)⊙S + M⊙P
+
+    The three coefficients determine what each frequency band contributes:
+        α (content LF weight) — how much of S's spatial structure survives
+          inside the mask. High = strict geometry preservation (retexturing).
+          Low = donor geometry can reshape the region (face/object swap).
+        β (donor LF weight)   — how much of R̃'s coarse material tone enters
+          the prior. Sets the color palette register inside the mask.
+        γ (donor HF weight)   — donor fine detail strength. Always high —
+          this is the primary transfer signal. The inpainting model amplifies it.
+
+    Histogram matching normalizes P's tone to match the surrounding source
+    context so the inpainting model does not treat the prior as corruption.
+
+    Reads coefficients from cfg["prior"]: alpha, beta, gamma, histogram_match.
 
     Returns:
-        source_pil       : PIL RGB (target_size × target_size)
-        aligned_pil      : PIL RGB (target_size × target_size)
-        lf_pil           : PIL RGB (target_size × target_size)
-        hf_pil           : PIL RGB (target_size × target_size)  HF shifted to [0,255]
-        chimera_pil      : PIL RGB (target_size × target_size)  source_LF + aligned_HF
-        face_mask_tensor : (1, 1, target_size, target_size) float32 [0,1]
+        PriorResult(P, X0, S_LF, S_HF, R_LF, R_HF, alpha, beta, gamma)
+    """
+    prior_cfg = cfg["prior"]
+
+    # Pass donor_aligned_bgr directly — build_prior() runs its own decomposition
+    # internally. Reconstructing from decomp.LF + decomp.HF would introduce
+    # float→uint8 rounding errors that alter the frequency split on the re-decomp.
+    prior_result = build_prior(
+        source_bgr        = content_bgr,
+        donor_aligned_bgr = donor_aligned_bgr,
+        mask              = object_mask_uint8,
+        alpha             = prior_cfg["alpha"],
+        beta              = prior_cfg["beta"],
+        gamma             = prior_cfg["gamma"],
+        histogram_match   = prior_cfg["histogram_match"],
+        method            = cfg["ablation"]["decomposition"],
+        kernel            = cfg["stage1"]["gaussian"]["kernel"],
+        sigma             = cfg["stage1"]["gaussian"]["sigma"],
+        cutoff_ratio      = cfg["stage1"]["fft"]["cutoff_ratio"],
+    )
+
+    # Verify X₀ correctness: outside-mask pixels must be identical to content
+    mask_bool = object_mask_uint8.astype(bool)
+    if mask_bool.any() and not mask_bool.all():
+        outside_content = content_bgr[~mask_bool]
+        outside_x0      = prior_result.X0[~mask_bool]
+        if not np.array_equal(outside_content, outside_x0):
+            raise RuntimeError(
+                "[stage1] FATAL — X₀ outside-mask pixels do not match content image.\n"
+                "  This means build_prior() has modified pixels outside the mask.\n"
+                "  Blended latent anchoring relies on X₀ = S outside the mask.\n"
+                "  Check decomposition.build_masked_input()."
+            )
+
+    print(
+        f"[stage1] Prior ready | "
+        f"α={prior_cfg['alpha']}  β={prior_cfg['beta']}  γ={prior_cfg['gamma']} | "
+        f"histogram_match={prior_cfg['histogram_match']} | "
+        f"P range=[{prior_result.P.min()},{prior_result.P.max()}] | "
+        f"X₀ outside-mask integrity: ✓"
+    )
+
+    return prior_result
+
+
+def step_convert(
+    cfg:              dict,
+    content_bgr:      np.ndarray,
+    donor_aligned_bgr: np.ndarray,
+    content_decomp,
+    donor_decomp,
+    prior_result:     "PriorResult",
+    object_mask_uint8: np.ndarray,
+):
+    """
+    Step 6: Convert all numpy outputs to pipeline-ready PIL images and tensors.
+
+    Resizes everything to target_size×target_size (SD2.1-base: 512px).
+    All Stage 2 inputs are at this resolution.
+
+    Returns:
+        content_pil        : PIL RGB  — content image S
+        donor_aligned_pil  : PIL RGB  — aligned donor R̃
+        s_lf_pil           : PIL RGB  — S_LF (content low-frequency)
+        r_hf_pil           : PIL RGB  — R̃_HF shifted to [0,255]
+        prior_pil          : PIL RGB  — prior P (inside-mask only, for visualization)
+        masked_input_pil   : PIL RGB  — X₀ = (1−M)⊙S + M⊙P (inpainting input)
+        object_mask_tensor : (1,1,target_size,target_size) float32 [0,1]
     """
     target_size = cfg["image"]["target_size"]
 
-    aligned_pil, lf_pil, hf_pil = to_pil_inputs(
-        result      = decomp_result,
-        aligned_bgr = aligned_face,
-        target_size = target_size,
-    )
+    def _to_pil(bgr: np.ndarray) -> Image.Image:
+        rgb = cv2.cvtColor(bgr.astype(np.uint8), cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb).resize((target_size, target_size), Image.LANCZOS)
 
-    face_mask_tensor = mask_to_tensor(face_mask_uint8, target_size=target_size)
+    def _hf_to_pil(hf: np.ndarray) -> Image.Image:
+        """Shift HF residual from [-128,127] to [0,255] for saving."""
+        shifted = np.clip(hf.astype(np.float32) + 128.0, 0, 255).astype(np.uint8)
+        rgb     = cv2.cvtColor(shifted, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb).resize((target_size, target_size), Image.LANCZOS)
 
-    source_rgb = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2RGB)
-    source_pil = Image.fromarray(source_rgb).resize(
-        (target_size, target_size), Image.LANCZOS
-    )
+    content_pil       = _to_pil(content_bgr)
+    donor_aligned_pil = _to_pil(donor_aligned_bgr)
+    s_lf_pil          = _to_pil(content_decomp.LF.astype(np.uint8))
+    r_hf_pil          = _hf_to_pil(donor_decomp.HF)
+    prior_pil         = _to_pil(prior_result.P)
+    masked_input_pil  = _to_pil(prior_result.X0)
 
-    # ── Chimera: source_LF + aligned_HF ──────────────────────────────────
-    chimera_bgr = build_chimera(
-        source_bgr   = source_bgr,
-        aligned_bgr  = aligned_face,
-        method       = cfg["ablation"]["decomposition"],
-        kernel       = cfg["stage1"]["gaussian"]["kernel"],
-        sigma        = cfg["stage1"]["gaussian"]["sigma"],
-        cutoff_ratio = cfg["stage1"]["fft"]["cutoff_ratio"],
-    )
-    chimera_rgb = cv2.cvtColor(chimera_bgr, cv2.COLOR_BGR2RGB)
-    chimera_pil = Image.fromarray(chimera_rgb).resize(
-        (target_size, target_size), Image.LANCZOS
-    )
+    object_mask_tensor = mask_to_tensor(object_mask_uint8)
 
     print(
         f"[stage1] Conversion done | "
-        f"PIL size={source_pil.size} | "
-        f"mask tensor shape={tuple(face_mask_tensor.shape)} "
-        f"range=[{face_mask_tensor.min():.2f}, {face_mask_tensor.max():.2f}]"
+        f"PIL size={content_pil.size} | "
+        f"mask tensor shape={tuple(object_mask_tensor.shape)} "
+        f"range=[{float(object_mask_tensor.min()):.2f}, {float(object_mask_tensor.max()):.2f}]"
     )
 
-    return source_pil, aligned_pil, lf_pil, hf_pil, chimera_pil, face_mask_tensor
+    return (
+        content_pil,
+        donor_aligned_pil,
+        s_lf_pil,
+        r_hf_pil,
+        prior_pil,
+        masked_input_pil,
+        object_mask_tensor,
+    )
 
 
-def step_save(cfg: dict, source_pil, aligned_pil, lf_pil, hf_pil,
-              face_mask_tensor, meta: dict):
+def step_save(
+    cfg:               dict,
+    content_pil:       "Image.Image",
+    donor_aligned_pil: "Image.Image",
+    s_lf_pil:          "Image.Image",
+    r_hf_pil:          "Image.Image",
+    prior_pil:         "Image.Image",
+    masked_input_pil:  "Image.Image",
+    object_mask_tensor: "torch.Tensor",
+    meta:              dict,
+):
     """
     Step 7: Save all artifacts to the artifacts directory.
 
     Files written:
-        source_pil.png    — source image (resized, RGB)
-        aligned_pil.png   — aligned reference (resized, RGB)
-        lf_pil.png        — LF component (resized, RGB)
-        hf_pil.png        — HF component shifted [0,255] (resized, RGB)
-        face_mask.pt      — (1,1,S,S) float32 tensor
-        meta.json         — all metadata Stage 2 reads at startup
+        content_pil.png        — content image S (resized, RGB)
+        donor_aligned_pil.png  — aligned donor R̃ (resized, RGB)
+        s_lf_pil.png           — S_LF component (resized, RGB)
+        r_hf_pil.png           — R̃_HF shifted [0,255] (resized, RGB)
+        prior_pil.png          — prior P — what's inside the mask (resized, RGB)
+        masked_input_pil.png   — X₀ = (1−M)⊙S + M⊙P — inpainting model input
+        object_mask.pt         — (1,1,S,S) float32 tensor
+        meta.json              — all metadata Stage 2 reads at startup
+
+    All files are required by Stage 2. Do not manually delete any of them.
+    object_mask.pt is used for both kv_cache.face_mask (shallow KV token gating)
+    and the latent-space mask Mz (blended latent anchoring every denoising step).
     """
     artifacts_dir = cfg["paths"]["artifacts_dir"]
     os.makedirs(artifacts_dir, exist_ok=True)
 
     saves = {
-        "source_pil.png"  : ("pil",    source_pil),
-        "aligned_pil.png" : ("pil",    aligned_pil),
-        "lf_pil.png"      : ("pil",    lf_pil),
-        "hf_pil.png"      : ("pil",    hf_pil),
-        "face_mask.pt"    : ("tensor", face_mask_tensor),
-        "meta.json"       : ("json",   meta),
-        "chimera_pil.png" : ("pil", chimera_pil),
+        "content_pil.png"       : ("pil",    content_pil),
+        "donor_aligned_pil.png" : ("pil",    donor_aligned_pil),
+        "s_lf_pil.png"          : ("pil",    s_lf_pil),
+        "r_hf_pil.png"          : ("pil",    r_hf_pil),
+        "prior_pil.png"         : ("pil",    prior_pil),
+        "masked_input_pil.png"  : ("pil",    masked_input_pil),
+        "object_mask.pt"        : ("tensor", object_mask_tensor),
+        "meta.json"             : ("json",   meta),
     }
 
     print(f"\n[stage1] Saving artifacts → {os.path.abspath(artifacts_dir)}/")
@@ -438,62 +600,91 @@ def step_save(cfg: dict, source_pil, aligned_pil, lf_pil, hf_pil,
             with open(fpath, "w") as f:
                 json.dump(obj, f, indent=2)
         size_kb = os.path.getsize(fpath) / 1024
-        print(f"  {fname:<22}  {size_kb:7.1f} KB")
+        print(f"  {fname:<28}  {size_kb:7.1f} KB")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # META BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_meta(cfg: dict, yaw_diff: float, decomp_result,
-               face_mask_uint8: np.ndarray) -> dict:
+def build_meta(
+    cfg:               dict,
+    alignment_result:  AlignmentResult,
+    content_decomp,
+    donor_decomp,
+    prior_result:      "PriorResult",
+    object_mask_uint8: np.ndarray,
+) -> dict:
     """
     Build the meta.json dict that Stage 2 reads at startup.
 
     Contains every parameter and stat needed to:
-        - Reproduce the run exactly (decomp method, mask type, kernel, etc.)
-        - Verify artifact quality (hf_std, mask_coverage, yaw_diff)
+        - Reproduce the run exactly (decomp method, mask type, α/β/γ, etc.)
+        - Verify artifact quality (HF_std, mask_coverage, prior stats)
         - Support the ablation runner (all ablation flags recorded)
+        - Audit the pipeline (provenance, timestamp, absolute paths)
+
+    Stage 2 (stage2_diffusion.py) reads this at load time and logs a
+    summary of what Stage 1 produced before starting the denoising loop.
     """
-    coverage = float(face_mask_uint8.astype(bool).mean() * 100)
+    coverage = float(object_mask_uint8.astype(bool).mean() * 100)
 
     return {
         # ── Image paths ──────────────────────────────────────────────────
-        "source_path"       : os.path.abspath(cfg["paths"]["source_image"]),
-        "reference_path"    : os.path.abspath(cfg["paths"]["reference_image"]),
+        "content_path"       : os.path.abspath(cfg["paths"]["content_image"]),
+        "donor_path"         : os.path.abspath(cfg["paths"]["donor_image"]),
 
         # ── Alignment ────────────────────────────────────────────────────
-        "yaw_diff_deg"      : round(float(yaw_diff), 3),
+        "alignment_method"   : alignment_result.method_used,
+        "alignment_fallback" : alignment_result.fallback,
+        "alignment_meta"     : alignment_result.meta,
 
         # ── Decomposition ─────────────────────────────────────────────────
-        "decomp_method"     : cfg["ablation"]["decomposition"],
-        "gauss_kernel"      : cfg["stage1"]["gaussian"]["kernel"],
-        "gauss_sigma"       : cfg["stage1"]["gaussian"]["sigma"],
-        "fft_cutoff"        : cfg["stage1"]["fft"]["cutoff_ratio"],
-        "lf_energy"         : round(float(decomp_result.lf_energy), 3),
-        "hf_std"            : round(float(decomp_result.hf_std),    3),
+        "decomp_method"      : cfg["ablation"]["decomposition"],
+        "gauss_kernel"       : cfg["stage1"]["gaussian"]["kernel"],
+        "gauss_sigma"        : cfg["stage1"]["gaussian"]["sigma"],
+        "fft_cutoff"         : cfg["stage1"]["fft"]["cutoff_ratio"],
+
+        # Content decomposition stats
+        "content_lf_energy"  : round(float(content_decomp.lf_energy), 3),
+        "content_hf_std"     : round(float(content_decomp.hf_std),    3),
+
+        # Donor decomposition stats
+        "donor_lf_energy"    : round(float(donor_decomp.lf_energy),   3),
+        "donor_hf_std"       : round(float(donor_decomp.hf_std),      3),
+
+        # ── Prior construction ────────────────────────────────────────────
+        "alpha"              : float(prior_result.alpha),
+        "beta"               : float(prior_result.beta),
+        "gamma"              : float(prior_result.gamma),
+        "histogram_match"    : cfg["prior"]["histogram_match"],
+        "prior_mean"         : round(float(prior_result.P.mean()), 3),
+        "prior_std"          : round(float(prior_result.P.std()),  3),
 
         # ── Mask ─────────────────────────────────────────────────────────
-        "mask_type"         : cfg["ablation"]["mask_type"],
-        "sam_model_type"    : cfg["paths"]["sam_model_type"],
-        "prompt_strategy"   : cfg["stage1"]["sam"]["prompt_strategy"],
-        "mask_coverage_pct" : round(coverage, 2),
+        "mask_type"          : cfg["ablation"]["mask_type"],
+        "sam_model_type"     : cfg["paths"].get("sam_model_type", "n/a"),
+        "prompt_strategy"    : cfg["stage1"]["sam"].get("prompt_strategy", "n/a"),
+        "mask_coverage_pct"  : round(coverage, 2),
 
         # ── Output format ─────────────────────────────────────────────────
-        "target_size"       : cfg["image"]["target_size"],
+        "target_size"        : cfg["image"]["target_size"],
 
-        # ── Ablation flags (all of them — Stage 2 and ablation_runner read these) ──
-        "ablation" : {
-            "decomposition"  : cfg["ablation"]["decomposition"],
-            "mask_type"      : cfg["ablation"]["mask_type"],
-            "depth_routing"  : cfg["ablation"]["depth_routing"],
-            "temporal_anneal": cfg["ablation"]["temporal_anneal"],
-            "mode"           : cfg["ablation"]["mode"],
+        # ── Ablation flags (Stage 2 and ablation_runner read these) ──────
+        "ablation": {
+            "decomposition"      : cfg["ablation"]["decomposition"],
+            "mask_type"          : cfg["ablation"]["mask_type"],
+            "prior_construction" : cfg["ablation"].get("prior_construction", "full"),
+            "blended_anchoring"  : cfg["ablation"].get("blended_anchoring",  True),
+            "shallow_injection"  : cfg["ablation"].get("shallow_injection",  True),
+            "histogram_match"    : cfg["ablation"].get("histogram_match",    True),
+            "temporal_anneal"    : cfg["ablation"].get("temporal_anneal",    True),
+            "compositing"        : cfg["ablation"].get("compositing",        "simple"),
         },
 
         # ── Provenance ────────────────────────────────────────────────────
-        "stage1_script"     : os.path.abspath(__file__),
-        "timestamp"         : datetime.datetime.now().isoformat(),
+        "stage1_script"      : os.path.abspath(__file__),
+        "timestamp"          : datetime.datetime.now().isoformat(),
     }
 
 
@@ -503,51 +694,82 @@ def build_meta(cfg: dict, yaw_diff: float, decomp_result,
 
 def run_stage1(cfg: dict):
     """
-    Execute all 7 Stage 1 steps in order.
+    Execute all Stage 1 steps in order.
 
-    All side effects (printing, file I/O) are in the step functions.
-    This function is the single sequence: load → align → mask → decompose
-    → convert → build meta → save.
+    All side effects (printing, file I/O) are contained inside each step
+    function. This function is the single sequence:
+        load → align → mask → decompose → prior → convert → meta → save
 
     Args:
         cfg : Fully resolved config dict (yaml + CLI overrides applied).
 
     Returns:
-        artifacts_dir : Path to the directory where artifacts were saved.
-        meta          : The meta dict that was written to meta.json.
+        artifacts_dir : Absolute path to the artifacts directory.
+        meta          : The meta dict written to meta.json.
     """
 
     # ── Step 1: Load images ───────────────────────────────────────────────
     _section("Step 1 — Load images")
-    source_bgr, reference_bgr = step_load_images(cfg)
+    content_bgr, donor_bgr = step_load_images(cfg)
 
-    # ── Step 2+3: Landmark detection + affine alignment ───────────────────
-    _section("Step 2+3 — Landmark detection + affine alignment")
-    alignment_result = step_align(cfg, source_bgr, reference_bgr)
-    src_lm       = alignment_result.src_result
-    aligned_face = alignment_result.aligned_face   # (H, W, 3) uint8 BGR
-    yaw_diff     = alignment_result.yaw_diff
+    # ── Step 2: Donor alignment ───────────────────────────────────────────
+    _section(f"Step 2 — Donor alignment  [method={cfg['alignment']['method']}]")
+    alignment_result  = step_align(cfg, content_bgr, donor_bgr)
+    donor_aligned_bgr = alignment_result.aligned_donor
 
-    # ── Step 4: Face mask ─────────────────────────────────────────────────
-    _section(f"Step 4 — Face mask  [mask_type={cfg['ablation']['mask_type']}]")
-    face_mask_uint8 = step_mask(cfg, source_bgr, src_lm)
+    # ── Step 3: Object mask ───────────────────────────────────────────────
+    _section(f"Step 3 — Object mask  [mask_type={cfg['ablation']['mask_type']}]")
+    object_mask_uint8 = step_mask(cfg, content_bgr)
 
-    # ── Step 5: Frequency decomposition ──────────────────────────────────
-    _section(f"Step 5 — Frequency decomposition  [method={cfg['ablation']['decomposition']}]")
-    decomp_result = step_decompose(cfg, aligned_face)
+    # ── Step 4: Frequency decomposition ──────────────────────────────────
+    _section(f"Step 4 — Frequency decomposition  [method={cfg['ablation']['decomposition']}]")
+    content_decomp, donor_decomp = step_decompose(cfg, content_bgr, donor_aligned_bgr)
+
+    # ── Step 5: Build mixed-frequency prior ───────────────────────────────
+    _section(
+        f"Step 5 — Build prior  "
+        f"[α={cfg['prior']['alpha']}  β={cfg['prior']['beta']}  γ={cfg['prior']['gamma']}]"
+    )
+    prior_result = step_build_prior(
+        cfg, content_bgr, donor_aligned_bgr, object_mask_uint8
+    )
 
     # ── Step 6: Format conversion ─────────────────────────────────────────
     _section("Step 6 — Format conversion (numpy → PIL + tensor)")
-    source_pil, aligned_pil, lf_pil, hf_pil, face_mask_tensor = step_convert(
-        cfg, decomp_result, aligned_face, face_mask_uint8, source_bgr
+    (
+        content_pil,
+        donor_aligned_pil,
+        s_lf_pil,
+        r_hf_pil,
+        prior_pil,
+        masked_input_pil,
+        object_mask_tensor,
+    ) = step_convert(
+        cfg, content_bgr, donor_aligned_bgr,
+        content_decomp, donor_decomp,
+        prior_result, object_mask_uint8,
     )
 
     # ── Build meta ────────────────────────────────────────────────────────
-    meta = build_meta(cfg, yaw_diff, decomp_result, face_mask_uint8)
+    meta = build_meta(
+        cfg, alignment_result,
+        content_decomp, donor_decomp,
+        prior_result, object_mask_uint8,
+    )
 
     # ── Step 7: Save artifacts ────────────────────────────────────────────
     _section("Step 7 — Save artifacts")
-    step_save(cfg, source_pil, aligned_pil, lf_pil, hf_pil, face_mask_tensor, meta)
+    step_save(
+        cfg,
+        content_pil,
+        donor_aligned_pil,
+        s_lf_pil,
+        r_hf_pil,
+        prior_pil,
+        masked_input_pil,
+        object_mask_tensor,
+        meta,
+    )
 
     return cfg["paths"]["artifacts_dir"], meta
 
@@ -564,20 +786,36 @@ def _section(title: str):
 
 def _print_summary(artifacts_dir: str, meta: dict):
     """Print a human-readable summary after all steps complete."""
+    coverage   = meta["mask_coverage_pct"]
+    hf_std     = meta["donor_hf_std"]
+    prior_std  = meta["prior_std"]
+
     print(f"\n{'═' * 60}")
     print(f"  Stage 1 complete")
     print(f"{'═' * 60}")
-    print(f"  artifacts_dir  : {os.path.abspath(artifacts_dir)}/")
-    print(f"  yaw_diff       : {meta['yaw_diff_deg']:.1f}°"
-          f"  {'✓ ok' if meta['yaw_diff_deg'] <= 35 else '⚠ large'}")
-    print(f"  mask_type      : {meta['mask_type']}")
-    print(f"  coverage       : {meta['mask_coverage_pct']:.1f}%")
-    print(f"  decomp_method  : {meta['decomp_method']}")
-    print(f"  HF_std         : {meta['hf_std']:.2f}"
-          f"  {'✓' if meta['hf_std'] > 10 else '⚠ low — check image texture'}")
-    print(f"  target_size    : {meta['target_size']}px")
-    print(f"  timestamp      : {meta['timestamp'][:19]}")
-    print(f"\n  Stage 2 is ready to run:")
+    print(f"  artifacts_dir    : {os.path.abspath(artifacts_dir)}/")
+    print(f"")
+    print(f"  alignment_method : {meta['alignment_method']}"
+          + ("  [fallback]" if meta["alignment_fallback"] else ""))
+    print(f"  mask_type        : {meta['mask_type']}")
+    print(f"  coverage         : {coverage:.1f}%  "
+          f"{'✓' if 5.0 < coverage < 95.0 else '⚠ check mask'}")
+    print(f"  decomp_method    : {meta['decomp_method']}")
+    print(f"  donor HF_std     : {hf_std:.2f}  "
+          f"{'✓' if hf_std > 5 else '⚠ low — donor may be flat / blurry'}")
+    print(f"")
+    print(f"  prior  α={meta['alpha']}  β={meta['beta']}  γ={meta['gamma']} | "
+          f"histogram_match={meta['histogram_match']}")
+    print(f"  prior_std        : {prior_std:.2f}  "
+          f"{'✓' if prior_std > 5 else '⚠ low — prior may be too smooth'}")
+    print(f"  target_size      : {meta['target_size']}px")
+    print(f"  timestamp        : {meta['timestamp'][:19]}")
+    print(f"")
+    print(f"  Key artifact for Stage 2:")
+    print(f"    artifacts/masked_input_pil.png  — inpainting model input X₀")
+    print(f"    artifacts/object_mask.pt        — mask tensor for KV gating + anchoring")
+    print(f"")
+    print(f"  Stage 2 is ready to run:")
     print(f"    python stage2_diffusion.py")
     print(f"{'═' * 60}\n")
 
@@ -588,7 +826,10 @@ def _print_summary(artifacts_dir: str, meta: dict):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Stage 1 — face alignment, segmentation, decomposition",
+        description=(
+            "Stage 1 — donor alignment, object segmentation, "
+            "and mixed-frequency prior construction"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -597,37 +838,74 @@ def parse_args():
         help="Path to YAML config file"
     )
 
-    # ── Image overrides ────────────────────────────────────────────────────
-    p.add_argument("--source",    default=None,
-                   help="Override paths.source_image")
-    p.add_argument("--reference", default=None,
-                   help="Override paths.reference_image")
-    p.add_argument("--artifacts-dir", default=None,
-                   help="Override paths.artifacts_dir")
+    # ── Image path overrides ───────────────────────────────────────────────
+    p.add_argument(
+        "--content", default=None,
+        help="Override paths.content_image (the image whose structure is preserved)"
+    )
+    p.add_argument(
+        "--donor", default=None,
+        help="Override paths.donor_image (the image whose texture/attributes are transferred)"
+    )
+    p.add_argument(
+        "--artifacts-dir", default=None,
+        help="Override paths.artifacts_dir"
+    )
 
-    # ── Model overrides ────────────────────────────────────────────────────
-    p.add_argument("--landmark-model", default=None,
-                   help="Override paths.landmark_model")
-    p.add_argument("--sam-checkpoint", default=None,
-                   help="Override paths.sam_checkpoint")
-    p.add_argument("--sam-type", default=None,
-                   choices=["vit_h", "vit_l", "vit_b", "mobile"],
-                   help="Override paths.sam_model_type")
+    # ── SAM model overrides ────────────────────────────────────────────────
+    p.add_argument(
+        "--sam-checkpoint", default=None,
+        help="Override paths.sam_checkpoint"
+    )
+    p.add_argument(
+        "--sam-type", default=None,
+        choices=["vit_h", "vit_l", "vit_b", "mobile"],
+        help="Override paths.sam_model_type"
+    )
 
-    # ── Ablation overrides ─────────────────────────────────────────────────
-    p.add_argument("--mask-type", default=None,
-                   choices=["sam", "convex_hull", "none"],
-                   help="Override ablation.mask_type")
-    p.add_argument("--decomp", default=None,
-                   choices=["gaussian", "fft", "none"],
-                   help="Override ablation.decomposition")
-    p.add_argument("--target-size", type=int, default=None,
-                   choices=[512, 768],
-                   help="Override image.target_size")
+    # ── Ablation / method overrides ────────────────────────────────────────
+    p.add_argument(
+        "--mask-type", default=None,
+        choices=["sam", "none"],
+        help="Override ablation.mask_type"
+    )
+    p.add_argument(
+        "--decomp", default=None,
+        choices=["gaussian", "fft", "none"],
+        help="Override ablation.decomposition"
+    )
+    p.add_argument(
+        "--align-method", default=None,
+        choices=["resize", "tile", "match", "flow", "affine"],
+        help="Override alignment.method"
+    )
+
+    # ── Prior coefficient overrides ────────────────────────────────────────
+    p.add_argument(
+        "--alpha", type=float, default=None,
+        help="Override prior.alpha (content LF weight, default 0.6)"
+    )
+    p.add_argument(
+        "--beta", type=float, default=None,
+        help="Override prior.beta (donor LF weight, default 0.5)"
+    )
+    p.add_argument(
+        "--gamma", type=float, default=None,
+        help="Override prior.gamma (donor HF weight, default 0.8)"
+    )
+
+    # ── Image resolution override ──────────────────────────────────────────
+    p.add_argument(
+        "--target-size", type=int, default=None,
+        choices=[512, 768],
+        help="Override image.target_size (512 for sd-2-inpainting, 768 for sd-2-inpainting-768)"
+    )
 
     # ── Utility ────────────────────────────────────────────────────────────
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print resolved config and exit without running")
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="Print resolved config and exit without running"
+    )
 
     return p.parse_args()
 
@@ -646,13 +924,13 @@ def main():
         print(f"\n[stage1] FATAL — {e}")
         sys.exit(1)
 
-    # Apply any CLI overrides
+    # Apply any CLI overrides on top of the yaml
     cfg = apply_cli_overrides(cfg, args)
 
-    # Print resolved config always (short, useful)
+    # Print resolved config (always — short and useful for debugging)
     print_config(cfg)
 
-    # Dry run: just show config and exit
+    # Dry run: show config and exit
     if args.dry_run:
         print("[stage1] --dry-run: exiting without running.\n")
         sys.exit(0)
@@ -664,6 +942,9 @@ def main():
         print(f"\n[stage1] FATAL — {e}\n")
         sys.exit(1)
     except ValueError as e:
+        print(f"\n[stage1] FATAL — {e}\n")
+        sys.exit(1)
+    except RuntimeError as e:
         print(f"\n[stage1] FATAL — {e}\n")
         sys.exit(1)
     except Exception as e:

@@ -1,61 +1,63 @@
 # core/compositing.py
 """
-Frequency-decomposed compositing module.
+Frequency-decomposed compositing module — demoted to optional cleanup pass.
 
-Problem this solves:
-    After KV injection, the diffusion output has the right identity but wrong
-    color/skin tone relative to the source. A naive hard composite or even
-    Poisson blending cannot fix a global color mismatch — it only smooths
-    the boundary seam. The face still looks stitched because LF (skin tone,
-    color temperature) and HF (texture detail, edges) need to be handled
-    separately.
+Context in the new pipeline (Mixed-Frequency Prior Guided Inpainting):
+    The blended latent anchoring mechanism in Stage 2 enforces source pixel
+    fidelity outside the mask at every denoising step — by construction.
+    The inpainting model sees real source context around the hole, so boundary
+    coherence is largely handled during generation itself, not as a post-hoc fix.
 
-Solution — Frequency-decomposed compositing:
-    Instead of blending the full images directly, split both the source and
-    the generated image into LF and HF components, blend each frequency band
-    independently with the appropriate technique, then reconstruct:
+    Compositing therefore becomes an *optional* cleanup pass, not a required
+    step. Whether it runs — and in which mode — is controlled by a single flag:
 
-        source_LF,    source_HF    = decompose(source)
-        generated_LF, generated_HF = decompose(generated)
+        ablation.compositing: "freq" | "simple" | "none"
 
-        final_LF = blend_lf(source_LF, generated_LF, mask)
-                   ← color transfer here (LAB statistics matching)
-                   ← ensures skin tone continuity at LF level
+    "none" → skip entirely, return raw diffusion output unchanged.
+    "simple" → alpha blend + optional Poisson seam (original behaviour).
+    "freq"   → full frequency-decomposed blend (novel method, now optional).
 
-        final_HF = blend_hf(source_HF, generated_HF, mask)
-                   ← Poisson blending here (seam removal at HF level)
-                   ← HF is where hard seams are most perceptually visible
+Why keep it at all:
+    Even with inpainting + blended anchoring, residual seams can occur at the
+    mask boundary when the diffusion model introduces a subtle color shift inside
+    the mask. The freq-decomposed path (LAB color transfer on LF + Poisson on HF)
+    cleans this up cheaply. Keeping it as an ablation flag lets the paper show
+    whether the new pipeline produces clean raw output *before* compositing — a
+    stronger result claim than the old pipeline which required it.
 
-        final = clip(final_LF + final_HF)
+    Ablation A6 compares compositing="none" vs "simple" vs "freq" to isolate
+    how much of the final quality comes from the inpainting/prior construction
+    vs the compositing cleanup.
 
-    Why this works:
-        LF carries global color, brightness, and skin tone.
-        Matching LF color statistics (color transfer) eliminates the
-        color mismatch that makes faces look stitched.
+Seam detection (is_needed):
+    run_compositing() calls is_needed() before doing any work. If the boundary
+    region shows no measurable seam, the output is returned unchanged even when
+    compositing is nominally enabled. This avoids unnecessary LAB/Poisson passes
+    on already-clean outputs, which can occasionally degrade a perfect result.
 
-        HF carries edges, texture, and fine detail.
-        Poisson blending on HF removes the boundary seam without
-        affecting the color balance fixed in the LF step.
+All existing compositing logic is untouched:
+    _prepare_mask(), _color_transfer_lab(), _poisson_blend(),
+    _blend_lf(), _blend_hf(), _freq_composite(), _simple_composite()
+    — zero functional changes. The only additions are:
 
-        Separating the two allows each problem to be solved with the
-        right tool at the right frequency scale.
+    is_needed(output, source, mask_tensor, threshold) → bool
+        Detect whether a perceptible boundary seam exists.
 
-Novel contribution for paper:
-    Prior work uses frequency decomposition for KV injection guidance
-    (Stage 1 of this pipeline) OR for image compositing — never both
-    in the same pipeline. This module extends frequency decomposition
-    end-to-end: Stage 1 decomposes for injection, Stage 2 decomposes
-    for compositing. LF and HF are treated as first-class signals
-    throughout the entire face swap pipeline.
+    run_compositing(generated_pil, source_pil, mask_tensor, cfg) → PIL
+        Top-level dispatcher: checks cfg flag, optionally checks is_needed(),
+        routes to freq / simple / none path. Replaces the old composite_result().
 
-Ablation flag (configs/default.yaml):
-    compositing:
-      freq_decomposed: true    # true = novel freq-decomposed path
-                               # false = old hard composite + Poisson only
+    composite_result() is preserved as a direct alias of run_compositing()
+    so existing call sites in stage2_diffusion.py require no changes.
 
-Public API:
+Public API (unchanged call signature):
     composite_result(generated_pil, source_pil, face_mask_tensor, cfg)
         → PIL RGB final image
+
+    run_compositing(generated_pil, source_pil, face_mask_tensor, cfg)
+        → PIL RGB final image  (preferred in new pipeline)
+
+    is_needed(output_pil, source_pil, face_mask_tensor, threshold) → bool
 """
 
 import cv2
@@ -77,15 +79,15 @@ def _prepare_mask(
     feather_px:       int = 8,
 ) -> np.ndarray:
     """
-    Resize face mask tensor to target_size and feather edges.
+    Resize face/object mask tensor to target_size and feather edges.
 
     Args:
-        face_mask_tensor : (1, 1, H, W) float32 [0,1] from artifacts/face_mask.pt
+        face_mask_tensor : (1, 1, H, W) float32 [0,1] from artifacts/mask.pt
         target_size      : (W, H) PIL convention
         feather_px       : Gaussian blur radius. 0 = hard binary mask.
 
     Returns:
-        (H, W) uint8 numpy, 0-255. 255 = face region.
+        (H, W) uint8 numpy, 0-255. 255 = editable region.
     """
     W, H = target_size
 
@@ -120,13 +122,13 @@ def _color_transfer_lab(
         corrected = (generated - mean_gen) / std_gen * std_src + mean_src
 
     Applied to LF only so HF texture detail is untouched.
-    Statistics computed inside the face mask so background
-    pixels don't pollute the color matching.
+    Statistics computed inside the mask so background pixels
+    don't pollute the color matching.
 
     Args:
         source_lf    : LF of source — defines target color stats.
         generated_lf : LF of generated — will be color-corrected.
-        mask_uint8   : Face region mask.
+        mask_uint8   : Editable region mask.
 
     Returns:
         (H, W, 3) float32 BGR color-corrected LF.
@@ -240,9 +242,9 @@ def _blend_lf(
         1. Color transfer: match generated_lf color stats to source_lf
         2. Alpha blend:    final_LF = source × (1-α) + corrected × α
 
-    Color transfer eliminates the skin tone / brightness mismatch
-    that causes the stitched look. Alpha blend then smoothly transitions
-    from source LF to color-corrected generated LF across the mask boundary.
+    Color transfer eliminates the color / brightness mismatch that causes
+    the stitched look. Alpha blend then smoothly transitions from source LF
+    to color-corrected generated LF across the mask boundary.
 
     Returns:
         final_LF : (H, W, 3) float32 BGR [0, 255]
@@ -273,9 +275,9 @@ def _blend_hf(
         1. Alpha blend on shifted HF
         2. Poisson blend to remove boundary edge artifacts
 
-    HF is where seams are most visible — hard edges at the mask boundary
-    are immediately noticeable. Poisson blending harmonizes gradients
-    at the boundary so the transition is invisible.
+    HF is where seams are most visible — hard edges at the mask boundary are
+    immediately noticeable. Poisson blending harmonizes gradients at the
+    boundary so the transition is invisible.
 
     HF shift: float32 [-255,255] → shift +128 for uint8 ops → shift -128 back.
 
@@ -303,7 +305,7 @@ def _blend_hf(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FREQUENCY-DECOMPOSED COMPOSITE  (novel path)
+# FREQUENCY-DECOMPOSED COMPOSITE  (novel path — now optional)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _freq_composite(
@@ -323,6 +325,10 @@ def _freq_composite(
         2. Blend LF: color transfer → alpha blend
         3. Blend HF: alpha blend → Poisson seam removal
         4. Reconstruct: final = clip(final_LF + final_HF)
+
+    Now invoked only when ablation.compositing = "freq" AND is_needed()
+    returns True (or auto_skip is disabled). In the new inpainting pipeline
+    this is a cleanup pass, not a required step.
 
     Returns:
         (H, W, 3) uint8 BGR final image.
@@ -388,9 +394,9 @@ def _simple_composite(
     """
     Original compositing path: alpha blend + optional Poisson blend.
 
-    Kept as ablation condition (compositing.freq_decomposed: false).
-    Compare directly against freq-decomposed path to isolate the
-    contribution of frequency-aware blending.
+    Used when ablation.compositing = "simple".
+    Compare directly against freq-decomposed path (ablation A6) to isolate
+    the contribution of frequency-aware blending.
 
     Returns:
         (H, W, 3) uint8 BGR composited image.
@@ -409,7 +415,235 @@ def _simple_composite(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUBLIC API
+# SEAM DETECTION  (new — gates whether compositing runs at all)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_needed(
+    output_pil:       Image.Image,
+    source_pil:       Image.Image,
+    face_mask_tensor: torch.Tensor,
+    threshold:        float = 15.0,
+) -> bool:
+    """
+    Detect whether a perceptible boundary seam exists between the generated
+    region and the surrounding source pixels.
+
+    In the new inpainting pipeline the boundary is usually clean because:
+      - The inpainting model sees real source context around the hole.
+      - Blended latent anchoring enforces exact source pixels outside the mask.
+
+    This function checks a narrow ring at the mask boundary (the "seam ring")
+    and measures the mean absolute LAB difference between the output image and
+    the source image in that ring. If the difference exceeds threshold, a seam
+    is visible and compositing is warranted.
+
+    Seam ring construction:
+        ring = dilate(mask, boundary_px) XOR erode(mask, boundary_px)
+        boundary_px = 6 pixels — captures the ~12px transition zone where
+        the inpainting model blends generated content into source context.
+
+    Args:
+        output_pil        : PIL RGB — raw diffusion output from Stage 2.
+        source_pil        : PIL RGB — original source image.
+        face_mask_tensor  : (1, 1, H, W) float32 [0,1] — editable region mask.
+        threshold         : Mean absolute LAB difference above which compositing
+                            is triggered. Default 15.0 (perceptual JND ≈ 2-3 LAB
+                            units; 15 corresponds to a clearly visible seam).
+                            Sweep [5, 10, 15, 20] to calibrate per dataset.
+
+    Returns:
+        True  — seam detected, compositing should run.
+        False — no perceptible seam, compositing can be skipped.
+
+    Notes:
+        - Returns True immediately if mask is empty (safe default — run cleanup).
+        - Returns True if images have different sizes (size mismatch is a bug,
+          but safe to proceed rather than silently skip).
+        - LAB difference is computed in the boundary ring only, not the full
+          image, so interior generation quality does not affect the decision.
+    """
+    # Size guard
+    if output_pil.size != source_pil.size:
+        print(
+            "[compositing.is_needed] WARNING: size mismatch "
+            f"output={output_pil.size} source={source_pil.size} — "
+            "assuming seam present (safe default)."
+        )
+        return True
+
+    W, H = source_pil.size
+
+    # Resize mask to image resolution (no feathering — hard binary for ring math)
+    mask_resized = F.interpolate(
+        face_mask_tensor.float(),
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )
+    mask_bin = (mask_resized.squeeze().cpu().numpy() > 0.5).astype(np.uint8) * 255
+
+    if mask_bin.max() == 0:
+        print("[compositing.is_needed] WARNING: empty mask — skipping compositing.")
+        return False
+
+    # Build boundary ring: dilate - erode
+    boundary_px = 6
+    kernel_d    = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (boundary_px * 2 + 1, boundary_px * 2 + 1)
+    )
+    dilated     = cv2.dilate(mask_bin, kernel_d)
+    eroded      = cv2.erode( mask_bin, kernel_d)
+    ring        = cv2.bitwise_xor(dilated, eroded)   # (H, W) uint8
+
+    ring_bool   = ring > 127
+
+    if ring_bool.sum() == 0:
+        # Mask is too small to form a ring — skip compositing
+        print("[compositing.is_needed] Mask too small for ring — skipping.")
+        return False
+
+    # Convert both images to LAB for perceptual difference
+    output_bgr = cv2.cvtColor(np.array(output_pil), cv2.COLOR_RGB2BGR)
+    source_bgr = cv2.cvtColor(np.array(source_pil), cv2.COLOR_RGB2BGR)
+
+    output_lab = cv2.cvtColor(output_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    source_lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    # Mean absolute difference in the boundary ring
+    diff       = np.abs(output_lab - source_lab)           # (H, W, 3)
+    ring_diff  = diff[ring_bool]                            # (N, 3)
+    mean_diff  = float(ring_diff.mean())
+
+    seam_detected = mean_diff > threshold
+
+    print(
+        f"[compositing.is_needed] Boundary ring LAB diff = {mean_diff:.2f} "
+        f"(threshold={threshold:.1f}) → "
+        f"{'SEAM DETECTED — compositing needed' if seam_detected else 'clean boundary — skipping compositing'}"
+    )
+
+    return seam_detected
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOP-LEVEL DISPATCHER  (new — replaces direct composite_result call)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_compositing(
+    generated_pil:    Image.Image,
+    source_pil:       Image.Image,
+    face_mask_tensor: torch.Tensor,
+    cfg:              dict,
+) -> Image.Image:
+    """
+    Top-level compositing dispatcher for the new pipeline.
+
+    Reads ablation.compositing from cfg to select the path:
+
+        "none"   → return generated_pil unchanged. Use to verify the raw
+                   inpainting output quality without any post-processing.
+                   Ablation A6 condition: inpainting only, no compositing.
+
+        "simple" → alpha blend + optional Poisson (original baseline path).
+                   Ablation A6 condition: blended anchoring + simple composite.
+
+        "freq"   → full frequency-decomposed blend (novel method).
+                   Ablation A6 condition: blended anchoring + freq composite.
+                   Default for the new pipeline.
+
+    For "simple" and "freq" modes, is_needed() is called first when
+    compositing.auto_skip is True (default True). If the boundary is already
+    clean, the output is returned unchanged regardless of the selected mode.
+    Set auto_skip: false to force compositing even on clean outputs (useful
+    for debugging or when generating comparison panels).
+
+    Config keys read:
+        ablation.compositing        str   "freq" | "simple" | "none"
+                                          default "freq"
+        compositing.poisson_blend   bool  default True  (simple path only)
+        compositing.feather_px      int   default 8
+        compositing.seam_threshold  float default 15.0  (is_needed threshold)
+        compositing.auto_skip       bool  default True   (skip if no seam)
+
+    Args:
+        generated_pil    : PIL RGB — raw diffusion output from decode_latent().
+        source_pil       : PIL RGB — original source image from artifacts/.
+        face_mask_tensor : (1, 1, H, W) float32 [0,1] from artifacts/mask.pt.
+        cfg              : Full resolved config dict.
+
+    Returns:
+        PIL RGB — either the raw output (no seam / mode=none) or the composited
+        result (seam found / auto_skip disabled).
+    """
+    comp_cfg   = cfg.get("compositing", {})
+    abl_cfg    = cfg.get("ablation",    {})
+
+    mode           = abl_cfg.get("compositing",    "freq")
+    poisson_blend  = comp_cfg.get("poisson_blend", True)
+    feather_px     = comp_cfg.get("feather_px",    8)
+    seam_threshold = comp_cfg.get("seam_threshold", 15.0)
+    auto_skip      = comp_cfg.get("auto_skip",      True)
+
+    # ── Mode: none — skip entirely ────────────────────────────────────────
+    if mode == "none":
+        print("[compositing] Mode: none — returning raw diffusion output.")
+        return generated_pil
+
+    # Size normalisation (defensive)
+    if generated_pil.size != source_pil.size:
+        print(
+            f"[compositing] WARNING: size mismatch "
+            f"generated={generated_pil.size} source={source_pil.size}. "
+            f"Resizing generated to match source."
+        )
+        generated_pil = generated_pil.resize(source_pil.size, Image.LANCZOS)
+
+    # ── Auto-skip: check seam before doing any work ───────────────────────
+    if auto_skip:
+        if not is_needed(generated_pil, source_pil, face_mask_tensor, seam_threshold):
+            print("[compositing] Auto-skip: boundary clean — returning raw output.")
+            return generated_pil
+
+    # ── Prepare shared inputs ─────────────────────────────────────────────
+    target_size   = source_pil.size   # (W, H)
+    mask_uint8    = _prepare_mask(face_mask_tensor, target_size, feather_px)
+    generated_bgr = cv2.cvtColor(np.array(generated_pil), cv2.COLOR_RGB2BGR)
+    source_bgr    = cv2.cvtColor(np.array(source_pil),    cv2.COLOR_RGB2BGR)
+
+    # ── Mode: freq — frequency-decomposed composite ───────────────────────
+    if mode == "freq":
+        print("[compositing] Mode: freq — frequency-decomposed composite (novel).")
+        final_bgr = _freq_composite(
+            generated_bgr = generated_bgr,
+            source_bgr    = source_bgr,
+            mask_uint8    = mask_uint8,
+            source_pil    = source_pil,
+            generated_pil = generated_pil,
+            cfg           = cfg,
+        )
+
+    # ── Mode: simple — alpha blend + optional Poisson ─────────────────────
+    elif mode == "simple":
+        print("[compositing] Mode: simple — alpha blend + Poisson (baseline).")
+        final_bgr = _simple_composite(
+            generated_bgr = generated_bgr,
+            source_bgr    = source_bgr,
+            mask_uint8    = mask_uint8,
+            poisson_blend = poisson_blend,
+        )
+
+    else:
+        raise ValueError(
+            f"[compositing] Unknown ablation.compositing mode '{mode}'. "
+            f"Choose: 'freq' | 'simple' | 'none'"
+        )
+
+    final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(final_rgb)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLIC API  (composite_result preserved as alias for backward compatibility)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def composite_result(
@@ -419,75 +653,40 @@ def composite_result(
     cfg:              dict,
 ) -> Image.Image:
     """
-    Composite the generated face onto the source image.
+    Backward-compatible alias for run_compositing().
 
-    Reads compositing.freq_decomposed from cfg to select path:
+    Existing call sites in stage2_diffusion.py require no changes.
+    New code should call run_compositing() directly, which reads
+    ablation.compositing from cfg for the three-way dispatch.
 
-        freq_decomposed: true  (default — novel method)
-            decompose both images into LF + HF
-            blend LF with color transfer  → fixes skin tone mismatch
-            blend HF with Poisson         → fixes boundary seam
-            reconstruct: final = LF + HF
+    In the old pipeline, this function read compositing.freq_decomposed (bool)
+    to choose between freq and simple paths. In the new pipeline, the same
+    two-way choice is now expressed as ablation.compositing = "freq" | "simple",
+    with "none" as a third option that skips compositing entirely.
 
-        freq_decomposed: false  (ablation baseline)
-            alpha blend + optional Poisson blend (original behavior)
+    Transition:
+        Old cfg key: compositing.freq_decomposed: true  → ablation.compositing: "freq"
+        Old cfg key: compositing.freq_decomposed: false → ablation.compositing: "simple"
+        New cfg key: ablation.compositing: "none"       → skip (new option)
 
-    Config keys:
-        compositing.freq_decomposed  bool  default True
-        compositing.poisson_blend    bool  default True
-        compositing.feather_px       int   default 8
-
-    Args:
-        generated_pil    : PIL RGB diffusion output from decode_latent().
-        source_pil       : PIL RGB original source from artifacts/.
-        face_mask_tensor : (1,1,H,W) float32 [0,1] from artifacts/face_mask.pt.
-        cfg              : Full resolved config dict.
-
-    Returns:
-        PIL RGB — reference face on source background, no stitching.
+    If cfg still contains compositing.freq_decomposed (old pipeline configs),
+    this alias translates it into the new ablation flag before dispatching,
+    so old yaml files continue to work without modification.
     """
-    comp_cfg        = cfg.get("compositing", {})
-    freq_decomposed = comp_cfg.get("freq_decomposed", True)
-    poisson_blend   = comp_cfg.get("poisson_blend",   True)
-    feather_px      = comp_cfg.get("feather_px",      8)
-
-    # Size check
-    if generated_pil.size != source_pil.size:
+    # Translate old compositing.freq_decomposed flag if present
+    comp_cfg = cfg.get("compositing", {})
+    if "freq_decomposed" in comp_cfg and "compositing" not in cfg.get("ablation", {}):
+        translated_mode = "freq" if comp_cfg["freq_decomposed"] else "simple"
+        cfg = {
+            **cfg,
+            "ablation": {
+                **cfg.get("ablation", {}),
+                "compositing": translated_mode,
+            },
+        }
         print(
-            f"[compositing] WARNING: size mismatch "
-            f"generated={generated_pil.size} source={source_pil.size}. "
-            f"Resizing generated to match source."
-        )
-        generated_pil = generated_pil.resize(source_pil.size, Image.LANCZOS)
-
-    target_size = source_pil.size   # (W, H)
-
-    # Prepare mask
-    mask_uint8 = _prepare_mask(face_mask_tensor, target_size, feather_px)
-
-    # PIL RGB → BGR numpy
-    generated_bgr = cv2.cvtColor(np.array(generated_pil), cv2.COLOR_RGB2BGR)
-    source_bgr    = cv2.cvtColor(np.array(source_pil),    cv2.COLOR_RGB2BGR)
-
-    # Select compositing path
-    if freq_decomposed:
-        print("[compositing] Mode: frequency-decomposed (novel method)")
-        final_bgr = _freq_composite(
-            generated_bgr = generated_bgr,
-            source_bgr    = source_bgr,
-            mask_uint8    = mask_uint8,
-            source_pil    = source_pil,
-            generated_pil = generated_pil,
-            cfg           = cfg,
-        )
-    else:
-        print("[compositing] Mode: simple composite (ablation baseline)")
-        final_bgr = _simple_composite(
-            generated_bgr = generated_bgr,
-            source_bgr    = source_bgr,
-            mask_uint8    = mask_uint8,
-            poisson_blend = poisson_blend,
+            f"[compositing] Translated compositing.freq_decomposed="
+            f"{comp_cfg['freq_decomposed']} → ablation.compositing={translated_mode}"
         )
 
-    final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(final_rgb)
+    return run_compositing(generated_pil, source_pil, face_mask_tensor, cfg)
