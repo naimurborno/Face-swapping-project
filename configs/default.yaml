@@ -143,7 +143,8 @@ stage2:
   negative_prompt: "blurry, smooth, flat color, cartoon, low quality, artifacts"
 
   num_inference_steps: 30
-  denoising_strength:  0.60       # Lower preserves mixed-prior texture; 1.0 nearly erases it
+  denoising_strength:  0.75       # Higher blends prior into context; lower preserves prior more literally
+  anchor_feather_px:   24         # Soft latent anchoring boundary; raise if edge still looks pasted
   guidance_scale:      7.5
   seed:                42
 
@@ -164,20 +165,13 @@ injection:
 
 
 # ── Compositing ───────────────────────────────────────────────────────────────
-# NOTE [9]: compositing.py is NOT currently imported or called by
-# stage2_diffusion.py. Every key in this section is dead config until
-# compositing is wired into the pipeline. Kept here for reference and
-# future wiring. To activate: import compositing.py in stage2 and call it
-# after decode_latent(), passing the compositing sub-config.
-#
-# freq_decomposed: true  → split source + generated into LF + HF, blend each
-#                          band separately (novel contribution)
-# freq_decomposed: false → simple alpha blend + optional Poisson (baseline)
+# Stage 2 now calls core/compositing.py after raw diffusion decode.
+# result.png is composited; raw_diffusion.png is also saved for debugging.
 compositing:
-  freq_decomposed: true    # A7: true=freq-decomposed blend | false=simple blend
-  poisson_blend:   true    # true=seamless cloning at boundary | false=alpha only
-  feather_px:      8       # mask edge feather radius (px). 0=hard binary mask
-  boundary_width:  20      # Poisson blend ring width (px) around mask edge
+  poisson_blend:   true
+  feather_px:      16       # raise to 24-32 if the transition still looks stitched
+  seam_threshold:  10.0
+  auto_skip:       false    # force cleanup while tuning seams
 
 
 # ── Ablation flags ────────────────────────────────────────────────────────────

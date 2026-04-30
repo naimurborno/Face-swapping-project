@@ -98,6 +98,7 @@ if os.path.isdir(_CORE):
 try:
     from core.kv_cache   import KVCache
     from core.patch_unet import patch_unet_attention, patch_unet_shallow_only
+    from core.compositing import run_compositing
 except ImportError as e:
     print(f"\n[stage2] FATAL — could not import core modules: {e}")
     print("  Make sure core/ exists and contains kv_cache.py, patch_unet.py,")
@@ -466,7 +467,14 @@ def _build_masked_conditioning_pil(
 # MASK DOWNSAMPLING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _downsample_mask(face_mask: torch.Tensor, latent_h: int, latent_w: int) -> torch.Tensor:
+def _downsample_mask(
+    face_mask: torch.Tensor,
+    latent_h: int,
+    latent_w: int,
+    *,
+    binary: bool = True,
+    feather_px: int = 0,
+) -> torch.Tensor:
     """
     Downsample the pixel-space mask to latent spatial resolution.
 
@@ -480,8 +488,9 @@ def _downsample_mask(face_mask: torch.Tensor, latent_h: int, latent_w: int) -> t
         latent_w  : latent width  (W/8)
 
     Returns:
-        (1, 1, latent_h, latent_w) float32 mask in [0, 1]
-        Threshold at 0.5 so boundary pixels are cleanly binary.
+        (1, 1, latent_h, latent_w) float32 mask in [0, 1].
+        binary=True gives a hard editable-region mask for the inpaint UNet.
+        binary=False gives a feathered anchoring mask for boundary blending.
     """
     m = F.interpolate(
         face_mask,
@@ -489,7 +498,15 @@ def _downsample_mask(face_mask: torch.Tensor, latent_h: int, latent_w: int) -> t
         mode="bilinear",
         align_corners=False,
     )
-    return (m > 0.5).float()
+    if binary:
+        return (m > 0.5).float()
+
+    if feather_px > 0:
+        latent_radius = max(1, int(round(feather_px / 8.0)))
+        kernel = latent_radius * 2 + 1
+        m = F.avg_pool2d(m, kernel_size=kernel, stride=1, padding=latent_radius)
+
+    return m.clamp(0.0, 1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -662,6 +679,7 @@ def run_denoising_loop(
     verbose          = cfg.get("logging", {}).get("verbose", True)
     denoise_strength = float(cfg["stage2"].get("denoising_strength", 0.60))
     denoise_strength = max(0.0, min(1.0, denoise_strength))
+    anchor_feather_px = int(cfg["stage2"].get("anchor_feather_px", 24))
 
     do_cfg = g_scale > 1.0
 
@@ -698,10 +716,19 @@ def run_denoising_loop(
     )
 
     # ── Latent-space mask ─────────────────────────────────────────────────
-    # Mz: (1, 1, H/8, W/8) float32 {0, 1}
-    # 1 = editable region (inside mask — diffusion fills this)
-    # 0 = frozen region  (outside mask — blended anchoring enforces S)
-    Mz = _downsample_mask(artifacts["face_mask"], latent_h, latent_w).to(device)
+    # Mz_edit: hard inpaint mask for the UNet's mask channel.
+    # Mz_anchor: soft mask for blended latent anchoring. The feathered boundary
+    # prevents the source/prior transition from behaving like a hard paste seam.
+    Mz_edit = _downsample_mask(
+        artifacts["face_mask"], latent_h, latent_w, binary=True
+    ).to(device=device, dtype=z_X0.dtype)
+    Mz_anchor = _downsample_mask(
+        artifacts["face_mask"],
+        latent_h,
+        latent_w,
+        binary=False,
+        feather_px=anchor_feather_px,
+    ).to(device=device, dtype=z_X0.dtype)
 
     # masked_image_latents: VAE encoding of source outside the mask and the
     # mixed prior inside. For texture transfer this prevents a black masked
@@ -817,7 +844,7 @@ def run_denoising_loop(
         # source-drifted content in the background region.
         if blended_anchor:
             z_S_noised = pipe.scheduler.add_noise(z_S, noise, t.unsqueeze(0))
-            latents    = _blend_latents(latents, z_S_noised, Mz)
+            latents    = _blend_latents(latents, z_S_noised, Mz_anchor)
 
         # ── Inject pass ───────────────────────────────────────────────────
         # Shallow layers will blend donor K,V into the current attention.
@@ -840,10 +867,10 @@ def run_denoising_loop(
 
         # Cast the components BEFORE concatenating
         src_input        = src_input.to(dtype=unet_dtype)
-        Mz               = Mz.to(dtype=unet_dtype)
+        Mz_edit          = Mz_edit.to(dtype=unet_dtype)
         z_S_masked       = z_S_masked.to(dtype=unet_dtype)
 
-        mask_input       = torch.cat([Mz] * 2)       if do_cfg else Mz
+        mask_input       = torch.cat([Mz_edit] * 2)       if do_cfg else Mz_edit
         masked_lat_in    = torch.cat([z_S_masked] * 2) if do_cfg else z_S_masked
         unet_input       = torch.cat([src_input, mask_input, masked_lat_in], dim=1)
 
@@ -881,7 +908,7 @@ def run_denoising_loop(
             else:
                 # Final step: use clean z_S (no noise)
                 z_S_noised_n = z_S
-            latents = _blend_latents(latents, z_S_noised_n, Mz)
+            latents = _blend_latents(latents, z_S_noised_n, Mz_anchor)
 
         # Free KV VRAM after each step
         if torch.cuda.is_available():
@@ -912,6 +939,7 @@ def save_results(
     artifacts:   dict,
     cfg:         dict,
     stage2_meta: dict,
+    raw_pil:     Image.Image = None,
 ) -> str:
     """
     Save all outputs to the output directory.
@@ -932,6 +960,10 @@ def save_results(
     # ── Result image ───────────────────────────────────────────────────────
     result_path = os.path.join(output_dir, "result.png")
     result_pil.save(result_path)
+
+    if raw_pil is not None:
+        raw_path = os.path.join(output_dir, "raw_diffusion.png")
+        raw_pil.save(raw_path)
 
     # ── 5-panel comparison ─────────────────────────────────────────────────
     panels = [
@@ -988,7 +1020,7 @@ def save_results(
 
     # ── Print summary ──────────────────────────────────────────────────────
     print(f"\n[stage2] Outputs saved → {os.path.abspath(output_dir)}/")
-    for fname in ["result.png", "comparison.png", "meta_stage2.json"]:
+    for fname in ["result.png", "raw_diffusion.png", "comparison.png", "meta_stage2.json"]:
         fpath = os.path.join(output_dir, fname)
         if os.path.exists(fpath):
             size_kb = os.path.getsize(fpath) / 1024
@@ -1023,6 +1055,8 @@ def build_stage2_meta(cfg: dict, stage1_meta: dict) -> dict:
         "pipeline_type"      : "inpainting",
         "scheduler"          : cfg["stage2"].get("scheduler", "DDIM"),
         "num_inference_steps": cfg["stage2"]["num_inference_steps"],
+        "denoising_strength" : cfg["stage2"].get("denoising_strength", 0.75),
+        "anchor_feather_px"  : cfg["stage2"].get("anchor_feather_px", 24),
         "guidance_scale"     : cfg["stage2"]["guidance_scale"],
         "seed"               : cfg["stage2"]["seed"],
         "prompt"             : cfg["stage2"]["prompt"],
@@ -1081,6 +1115,9 @@ def _print_final_summary(result_path: str, cfg: dict, stage1_meta: dict):
     print(f"  blended_anchoring  : {cfg['ablation'].get('blended_anchoring', True)}")
     print(f"  shallow_injection  : {cfg['ablation'].get('shallow_injection', True)}")
     print(f"  injection_scale    : {cfg['injection']['injection_scale']}")
+    print(f"  denoising_strength : {cfg['stage2'].get('denoising_strength', 0.75)}")
+    print(f"  anchor_feather_px  : {cfg['stage2'].get('anchor_feather_px', 24)}")
+    print(f"  compositing        : {cfg['ablation'].get('compositing', 'freq')}")
     print(f"  temporal_anneal    : {cfg['ablation'].get('temporal_anneal', True)}")
     print(f"  alpha / beta / gamma: "
           f"{stage1_meta.get('alpha', '?')} / "
@@ -1147,13 +1184,22 @@ def run_stage2(cfg: dict):
 
     # ── Step 4: Decode ────────────────────────────────────────────────────
     _section("Step 4 — Decode latent → image")
-    result_pil = decode_latent(pipe, latents)
-    print(f"[stage2] Decoded: {result_pil.size} {result_pil.mode}")
+    raw_pil = decode_latent(pipe, latents)
+    print(f"[stage2] Decoded: {raw_pil.size} {raw_pil.mode}")
 
-    # ── Step 5: Save ──────────────────────────────────────────────────────
-    _section("Step 5 — Save outputs")
+    # ── Step 5: Optional compositing cleanup ──────────────────────────────
+    _section("Step 5 — Boundary cleanup / compositing")
+    result_pil = run_compositing(
+        raw_pil,
+        artifacts["content_pil"],
+        artifacts["face_mask"],
+        cfg,
+    )
+
+    # ── Step 6: Save ──────────────────────────────────────────────────────
+    _section("Step 6 — Save outputs")
     stage2_meta = build_stage2_meta(cfg, stage1_meta)
-    result_path = save_results(result_pil, artifacts, cfg, stage2_meta)
+    result_path = save_results(result_pil, artifacts, cfg, stage2_meta, raw_pil=raw_pil)
 
     return result_pil, result_path
 
