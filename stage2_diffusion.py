@@ -13,7 +13,7 @@ All it needs from disk:
     artifacts/donor_aligned_pil.png— aligned donor R̃ (texture source)
     artifacts/prior_pil.png        — mixed-frequency prior P = αS_LF + βR̃_LF + γR̃_HF
     artifacts/masked_input_pil.png — X₀ = (1-M)⊙S + M⊙P  (what diffusion sees)
-    artifacts/face_mask.pt         — (1,1,S,S) float32 mask tensor M
+    artifacts/object_mask.pt       — (1,1,S,S) float32 mask tensor M
     artifacts/meta.json            — ablation flags + stats written by Stage 1
 
 Denoising loop (per timestep t):
@@ -86,6 +86,7 @@ import traceback
 import torch
 import torch.nn.functional as F
 import yaml
+import numpy as np
 from PIL import Image
 
 # ── Path setup ────────────────────────────────────────────────────────────────
@@ -192,7 +193,7 @@ def load_artifacts(artifacts_dir: str) -> dict:
         donor_aligned_pil.png — aligned donor R̃
         prior_pil.png         — mixed-frequency prior P
         masked_input_pil.png  — X₀ = (1-M)⊙S + M⊙P
-        face_mask.pt          — (1,1,S,S) float32 mask tensor M
+        object_mask.pt        — (1,1,S,S) float32 mask tensor M
         meta.json             — stage1 config + stats
 
     Returns:
@@ -206,7 +207,7 @@ def load_artifacts(artifacts_dir: str) -> dict:
         "donor_aligned_pil.png" : "PIL",
         "prior_pil.png"         : "PIL",
         "masked_input_pil.png"  : "PIL",
-        "face_mask.pt"          : "tensor",
+        "object_mask.pt"        : "tensor",
         "meta.json"             : "json",
     }
 
@@ -231,7 +232,7 @@ def load_artifacts(artifacts_dir: str) -> dict:
     masked_input_pil  = Image.open(_path("masked_input_pil.png")).convert("RGB")
 
     # map_location="cpu" so it loads regardless of GPU state
-    face_mask = torch.load(_path("face_mask.pt"), map_location="cpu")
+    face_mask = torch.load(_path("object_mask.pt"), map_location="cpu")
 
     with open(_path("meta.json"), "r") as f:
         meta = json.load(f)
@@ -396,6 +397,33 @@ def _encode_source_latent(
     return _encode_to_latent(vae, image_processor, content_pil)
 
 
+def _build_masked_source_pil(
+    content_pil: Image.Image,
+    face_mask: torch.Tensor,
+) -> Image.Image:
+    """
+    Build the inpainting conditioning image expected by SD inpaint:
+    source pixels outside the mask, black pixels inside the editable region.
+
+    This is intentionally different from masked_input_pil. masked_input_pil
+    carries the mixed prior as the img2img initialization; masked_source_pil
+    carries the known-pixels conditioning channel for the inpaint UNet.
+    """
+    W, H = content_pil.size
+    mask_resized = F.interpolate(
+        face_mask.float(),
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )
+    mask_np = np.clip(mask_resized.squeeze().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+    mask_pil = Image.fromarray(mask_np, mode="L")
+
+    masked = content_pil.copy()
+    masked.paste(Image.new("RGB", content_pil.size, (0, 0, 0)), mask=mask_pil)
+    return masked
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MASK DOWNSAMPLING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -474,6 +502,7 @@ def _blend_latents(
 @torch.no_grad()
 def _shallow_store_pass(
     unet,
+    scheduler,
     donor_lat:   torch.Tensor,   # (1, 4, H/8, W/8) donor aligned latent
     ref_embeds:  torch.Tensor,   # uncond text embeds (no CFG needed here)
     kv_cache:    KVCache,
@@ -519,9 +548,25 @@ def _shallow_store_pass(
     kv_cache.set_freq_mode("hf")
     kv_cache.set_mode("store")
 
+    # Build 9-channel inpainting input:
+    #   channel layout: [noisy_latent(4) | mask(1) | masked_image_latents(4)]
+    # For the donor store pass the mask is all-zeros (nothing is masked —
+    # the entire donor is "known"). masked_image_latents = donor_lat.
+    # This gives the UNet full, unobstructed access to donor surface features.
+    B, _, H, W = donor_lat.shape
+    mask_zeros = torch.zeros(B, 1, H, W, device=donor_lat.device, dtype=donor_lat.dtype)
+    donor_noise = torch.randn(
+        donor_lat.shape,
+        device=donor_lat.device,
+        dtype=donor_lat.dtype,
+    )
     t = timestep.unsqueeze(0) if timestep.ndim == 0 else timestep
+    donor_noised = scheduler.add_noise(donor_lat, donor_noise, t)
+
+    unet_input = torch.cat([donor_noised, mask_zeros, donor_lat], dim=1)  # (B, 9, H, W)
+
     unet(
-        donor_lat,
+        unet_input,
         t,
         encoder_hidden_states  = ref_embeds,
         cross_attention_kwargs = {"kv_cache": kv_cache},
@@ -576,7 +621,9 @@ def run_denoising_loop(
     seed             = cfg["stage2"]["seed"]
     prompt           = cfg["stage2"]["prompt"]
     neg              = cfg["stage2"].get("negative_prompt", "")
-    verbose          = cfg["logging"].get("verbose", True)
+    verbose          = cfg.get("logging", {}).get("verbose", True)
+    denoise_strength = float(cfg["stage2"].get("denoising_strength", 0.60))
+    denoise_strength = max(0.0, min(1.0, denoise_strength))
 
     do_cfg = g_scale > 1.0
 
@@ -618,6 +665,16 @@ def run_denoising_loop(
     # 0 = frozen region  (outside mask — blended anchoring enforces S)
     Mz = _downsample_mask(artifacts["face_mask"], latent_h, latent_w).to(device)
 
+    # masked_image_latents: VAE encoding of the pixel-space masked source image.
+    # This matches the SD inpaint training contract better than encoding S first
+    # and zeroing latent cells afterward.
+    masked_source_pil = _build_masked_source_pil(
+        artifacts["content_pil"], artifacts["face_mask"]
+    )
+    z_S_masked = _encode_to_latent(
+        pipe.vae, pipe.image_processor, masked_source_pil
+    )
+
     # ── Prompt embeddings ─────────────────────────────────────────────────
     _section("Encoding prompts")
 
@@ -640,7 +697,15 @@ def run_denoising_loop(
 
     # ── Scheduler timesteps ───────────────────────────────────────────────
     pipe.scheduler.set_timesteps(steps, device=device)
-    timesteps = pipe.scheduler.timesteps   # (T,) descending, e.g. 999→0
+    all_timesteps = pipe.scheduler.timesteps   # descending, e.g. 999→0
+
+    # Img2img-style strength: start from a partially noised mixed-prior latent.
+    # strength=1.0 almost erases the prior; lower values preserve texture cues.
+    init_timestep = min(int(steps * denoise_strength), steps)
+    t_start       = max(steps - init_timestep, 0)
+    timesteps     = all_timesteps[t_start:]
+    if len(timesteps) == 0:
+        timesteps = all_timesteps[-1:]
     T         = len(timesteps)
 
     # ── Generator for reproducibility ────────────────────────────────────
@@ -654,7 +719,10 @@ def run_denoising_loop(
     #   at every step anyway by blended latent anchoring.
     latents = pipe.scheduler.add_noise(z_X0, noise, timesteps[:1])
 
-    print(f"[stage2] Starting denoising | steps={T} | seed={seed}")
+    print(
+        f"[stage2] Starting denoising | requested_steps={steps} | "
+        f"active_steps={T} | denoising_strength={denoise_strength:.2f} | seed={seed}"
+    )
     print(f"[stage2] blended_anchoring={blended_anchor} | "
           f"shallow_injection={shallow_inject} | "
           f"temporal_anneal={anneal} | injection_scale={scale}")
@@ -667,7 +735,7 @@ def run_denoising_loop(
         # Use a representative mid-noise timestep for stable feature capture
         mid_idx = T // 2
         mid_t   = timesteps[mid_idx]
-        _shallow_store_pass(pipe.unet, donor_lat, ref_embeds, kv_cache, mid_t)
+        _shallow_store_pass(pipe.unet, pipe.scheduler, donor_lat, ref_embeds, kv_cache, mid_t)
         # Cache is now populated. Mode is reset to bypass before the loop.
         kv_cache.set_mode("bypass")
         print(
@@ -721,13 +789,34 @@ def run_denoising_loop(
             kv_cache.set_mode("bypass")
 
         src_input  = torch.cat([latents] * 2) if do_cfg else latents
+
+        # Build 9-channel inpainting UNet input:
+        #   [noisy_latent(4) | mask(1) | masked_image_latents(4)]
+        # CFG doubles the batch on all three tensors.
+        # mask_input    = torch.cat([Mz] * 2)       if do_cfg else Mz
+        # masked_lat_in = torch.cat([z_S_masked] * 2) if do_cfg else z_S_masked
+        # unet_input    = torch.cat([src_input, mask_input, masked_lat_in], dim=1)
+        unet_dtype = next(pipe.unet.parameters()).dtype
+
+        # Cast the components BEFORE concatenating
+        src_input        = src_input.to(dtype=unet_dtype)
+        Mz               = Mz.to(dtype=unet_dtype)
+        z_S_masked       = z_S_masked.to(dtype=unet_dtype)
+
+        mask_input       = torch.cat([Mz] * 2)       if do_cfg else Mz
+        masked_lat_in    = torch.cat([z_S_masked] * 2) if do_cfg else z_S_masked
+        unet_input       = torch.cat([src_input, mask_input, masked_lat_in], dim=1)
+
+        t_in = t.to(dtype=unet_dtype)
+        t_in = t_in.unsqueeze(0) if t_in.ndim == 0 else t_in
+
         noise_pred = pipe.unet(
-            src_input,
-            t.unsqueeze(0) if t.ndim == 0 else t,
+            unet_input,
+            t_in,
             encoder_hidden_states  = text_embeds if do_cfg else prompt_embeds,
             cross_attention_kwargs = {"kv_cache": kv_cache},
         ).sample
-
+        
         # CFG: combine uncond and cond noise predictions
         if do_cfg:
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
@@ -768,13 +857,8 @@ def run_denoising_loop(
 
 @torch.no_grad()
 def decode_latent(pipe, latents: torch.Tensor) -> Image.Image:
-    """
-    Decode a latent tensor to a PIL RGB image.
-
-    Divides by scaling_factor before decoding (inverse of encode).
-    pipe.image_processor.postprocess() handles [-1,1] → [0,255] and uint8 cast.
-    """
-    latents = latents / pipe.vae.config.scaling_factor
+    vae_dtype = next(pipe.vae.parameters()).dtype
+    latents = (latents / pipe.vae.config.scaling_factor).to(dtype=vae_dtype)
     image   = pipe.vae.decode(latents).sample
     return pipe.image_processor.postprocess(image, output_type="pil")[0]
 
@@ -826,8 +910,11 @@ def save_results(
     ]
 
     W, H      = panels[0].size
-    pad       = 4
-    label_h   = 22
+    pad       = 8
+    label_h   = 36
+    scale     = 3
+    W, H      = W * scale, H * scale
+    panels    = [p.resize((W, H), Image.LANCZOS) for p in panels]
     total_w   = W * len(panels) + pad * (len(panels) + 1)
     total_h   = H + label_h + pad * 2
     comparison = Image.new("RGB", (total_w, total_h), (30, 30, 30))

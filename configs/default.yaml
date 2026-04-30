@@ -139,10 +139,11 @@ stage2:
 
   scheduler:           "DDIM"        # "DDIM" | "PNDM" | "DPMSolver"
 
-  prompt:          "photorealistic portrait photo, sharp focus, natural skin texture"
-  negative_prompt: "blurry, deformed, cartoon, anime, low quality, artifacts"
+  prompt:          "photorealistic surface texture, sharp fine detail, natural lighting"
+  negative_prompt: "blurry, smooth, flat color, cartoon, low quality, artifacts"
 
   num_inference_steps: 30
+  denoising_strength:  0.60       # Lower preserves mixed-prior texture; 1.0 nearly erases it
   guidance_scale:      7.5
   seed:                42
 
