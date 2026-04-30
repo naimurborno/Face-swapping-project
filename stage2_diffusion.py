@@ -242,6 +242,15 @@ def load_artifacts(artifacts_dir: str) -> dict:
         f"[stage2]   content={content_pil.size} | donor={donor_aligned_pil.size} | "
         f"prior={prior_pil.size} | mask={tuple(face_mask.shape)}"
     )
+    _print_masked_artifact_stats(
+        {
+            "content": content_pil,
+            "donor": donor_aligned_pil,
+            "prior": prior_pil,
+            "masked_input": masked_input_pil,
+        },
+        face_mask,
+    )
 
     return {
         "content_pil"       : content_pil,
@@ -251,6 +260,32 @@ def load_artifacts(artifacts_dir: str) -> dict:
         "face_mask"         : face_mask,
         "meta"              : meta,
     }
+
+
+def _print_masked_artifact_stats(images: dict, face_mask: torch.Tensor):
+    """Print simple masked-region image stats to catch black/flat priors early."""
+    first_img = next(iter(images.values()))
+    W, H = first_img.size
+    mask_resized = F.interpolate(
+        face_mask.float(),
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )
+    mask_bool = mask_resized.squeeze().cpu().numpy() > 0.5
+
+    if not mask_bool.any():
+        print("[stage2] WARNING: mask is empty while computing artifact stats.")
+        return
+
+    print("[stage2] Masked-region artifact stats:")
+    for name, pil in images.items():
+        arr = np.asarray(pil.resize((W, H), Image.LANCZOS)).astype(np.float32)
+        pix = arr[mask_bool]
+        print(
+            f"[stage2]   {name:<12} mean={pix.mean():6.1f} "
+            f"std={pix.std():6.1f} min={pix.min():5.0f} max={pix.max():5.0f}"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -397,17 +432,20 @@ def _encode_source_latent(
     return _encode_to_latent(vae, image_processor, content_pil)
 
 
-def _build_masked_source_pil(
+def _build_masked_conditioning_pil(
     content_pil: Image.Image,
+    fill_pil: Image.Image,
     face_mask: torch.Tensor,
 ) -> Image.Image:
     """
-    Build the inpainting conditioning image expected by SD inpaint:
-    source pixels outside the mask, black pixels inside the editable region.
+    Build the inpainting conditioning image for the 9-channel UNet:
+    source pixels outside the mask, mixed-prior pixels inside the mask.
 
-    This is intentionally different from masked_input_pil. masked_input_pil
-    carries the mixed prior as the img2img initialization; masked_source_pil
-    carries the known-pixels conditioning channel for the inpaint UNet.
+    Standard SD inpaint uses black pixels inside the masked region. In this
+    mixed-prior texture-transfer loop, that black hole can leak into the final
+    region because we are also doing partial-noise img2img initialization.
+    Filling the hole with the mixed prior keeps the conditioning aligned with
+    the texture we want instead of teaching the UNet that the region is black.
     """
     W, H = content_pil.size
     mask_resized = F.interpolate(
@@ -419,9 +457,9 @@ def _build_masked_source_pil(
     mask_np = np.clip(mask_resized.squeeze().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
     mask_pil = Image.fromarray(mask_np, mode="L")
 
-    masked = content_pil.copy()
-    masked.paste(Image.new("RGB", content_pil.size, (0, 0, 0)), mask=mask_pil)
-    return masked
+    conditioned = content_pil.copy()
+    conditioned.paste(fill_pil.resize(content_pil.size, Image.LANCZOS), mask=mask_pil)
+    return conditioned
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -665,14 +703,16 @@ def run_denoising_loop(
     # 0 = frozen region  (outside mask — blended anchoring enforces S)
     Mz = _downsample_mask(artifacts["face_mask"], latent_h, latent_w).to(device)
 
-    # masked_image_latents: VAE encoding of the pixel-space masked source image.
-    # This matches the SD inpaint training contract better than encoding S first
-    # and zeroing latent cells afterward.
-    masked_source_pil = _build_masked_source_pil(
-        artifacts["content_pil"], artifacts["face_mask"]
+    # masked_image_latents: VAE encoding of source outside the mask and the
+    # mixed prior inside. For texture transfer this prevents a black masked
+    # conditioning image from leaking into the generated region.
+    masked_conditioning_pil = _build_masked_conditioning_pil(
+        artifacts["content_pil"],
+        artifacts["masked_input_pil"],
+        artifacts["face_mask"],
     )
     z_S_masked = _encode_to_latent(
-        pipe.vae, pipe.image_processor, masked_source_pil
+        pipe.vae, pipe.image_processor, masked_conditioning_pil
     )
 
     # ── Prompt embeddings ─────────────────────────────────────────────────
