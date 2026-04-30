@@ -394,8 +394,8 @@ def step_decompose(cfg: dict, content_bgr: np.ndarray, donor_aligned_bgr: np.nda
         cutoff_ratio = fft_cfg["cutoff_ratio"],
     )
 
-    content_decomp = decompose(aligned_bgr=content_bgr,   **decomp_kwargs)
-    donor_decomp   = decompose(aligned_bgr=donor_aligned_bgr, **decomp_kwargs)
+    content_decomp = decompose(content_bgr,   **decomp_kwargs)
+    donor_decomp   = decompose(donor_aligned_bgr, **decomp_kwargs)
 
     print(
         f"[stage1] Decomposition done | method={method}\n"
