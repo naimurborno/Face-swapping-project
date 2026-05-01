@@ -1,41 +1,14 @@
-# ============================================================
 # default.yaml — Master config for the inpainting pipeline
-# ============================================================
-# Every hyperparameter, path, and ablation flag lives here.
 # One flag = one change. No code surgery for ablations.
-#
-# FIXES vs original:
-#   [1] Added alignment: section (was missing → KeyError crash in stage1)
-#   [2] Fixed stage2.model_id to inpainting checkpoint (was sd-2-1-base →
-#       wrong UNet input channels for StableDiffusionInpaintPipeline)
-#   [3] Fixed stage1.sam.prompt_strategy to valid options from segmentation.py
-#       ("text" | "center_point" | "bbox") — old options "nose_tip" and
-#       "eye_center" were face-swap leftovers; segmentation.py rejects them
-#   [4] Removed injection.shallow_only (never read; code uses
-#       ablation.shallow_injection instead)
-#   [5] Removed ablation.mode and ablation.injection_mode (never read by
-#       stage2_diffusion.py — dead flags from old phase design)
-#   [6] Removed injection.depth sub-section (patch_unet.py hardcodes its
-#       own prefix tuples; this section controlled nothing)
-#   [7] Removed stage1.mediapipe section (not consumed by any uploaded
-#       script in the current pipeline)
-#   [8] Removed stage1.convex_hull section (convex_hull mask_type is not
-#       implemented in segmentation.py or stage1_segment.py; CLI also
-#       rejects it — only "sam" | "none" are valid for mask_type)
-#   [9] Added compositing NOTE — compositing.py is not imported or called
-#       by stage2_diffusion.py; this section controls nothing yet
-#  [10] Added ablation.depth_routing NOTE — stage2 hardcodes "correct";
-#       the yaml value is not read but kept for documentation / future wiring
-# ============================================================
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 paths:
-  content_image:  "inputs/source.jpg"       # content image S  (structure to keep)
-  donor_image:    "inputs/reference.jpg"    # donor image R    (texture to transfer)
-  artifacts_dir:  "artifacts/"              # stage1 writes here; stage2 reads from here
-  output_dir:     "outputs/"                # stage2 final results saved here
-  sam_checkpoint: "sam_vit_h_4b8939.pth"   # SAM model checkpoint path
+  content_image:  "inputs/source.jpg"
+  donor_image:    "inputs/reference.jpg"
+  artifacts_dir:  "artifacts/"              # stage1 + stage1b write here; stage2 reads from here
+  output_dir:     "outputs/"
+  sam_checkpoint: "sam_vit_h_4b8939.pth"
   sam_model_type: "vit_h"                   # "vit_h" | "vit_l" | "vit_b" | "mobile"
 
 
@@ -45,97 +18,44 @@ image:
 
 
 # ── Donor alignment ───────────────────────────────────────────────────────────
-# FIX [1]: this section was missing entirely. stage1_segment.py reads
-# cfg["alignment"]["method"] at line 268 and in print_config → KeyError crash.
-#
-# method choices:
-#   "resize"  — simple resize to content canvas (default, no extra deps)
-#   "tile"    — tile donor to fill content canvas (for tileable textures)
-#   "match"   — ORB feature matching + affine RANSAC (requires cv2)
-#   "flow"    — dense optical flow warp / Farneback (most expensive)
-#   "affine"  — explicit affine from user-supplied point pairs
+# "resize" | "tile" | "match" (requires cv2) | "flow" | "affine"
 alignment:
   method: "resize"
 
 
-# ── Prior construction: P = α·S_LF + β·R̃_LF + γ·R̃_HF ───────────────────────
-# α (alpha): weight on content low-frequency  — controls how much content
-#            colour/tone bleeds into the prior. Higher → prior is more neutral.
-# β (beta) : weight on donor low-frequency    — controls colour temperature
-#            transfer from donor. Higher → stronger colour cast.
-# γ (gamma): weight on donor high-frequency   — controls texture transfer
-#            strength. This is the primary signal. Higher → sharper donor detail.
-# histogram_match: normalise P to match content image statistics before use.
-#   Reduces colour mismatch at the mask boundary.
-prior:
-  alpha:            0.6
-  beta:             0.5
-  gamma:            0.8
-  histogram_match:  true
-
-
-# ── Stage 1: Segmentation + Decomposition ─────────────────────────────────────
+# ── Stage 1: Segmentation only ────────────────────────────────────────────────
+# Decomposition and prior construction removed — texture enters via KV injection.
 stage1:
-
-  # SAM segmentation (used when ablation.mask_type = "sam")
-  # FIX [3]: prompt_strategy options changed to match segmentation.py.
-  #   Valid: "text" | "center_point" | "bbox"
-  #   Invalid (old face-swap values, rejected by segmentation.py):
-  #     "nose_tip", "eye_center" — removed
-  #
-  # prompt_strategy: "text"
-  #   Requires Grounding DINO. stage1_segment.py does not currently pass
-  #   text_prompt or dino_model to get_object_mask() — setting this will
-  #   silently fall back to "center_point" until stage1 is wired to pass them.
-  #   Wire-up: add dino_model loading + pass text_prompt/dino_model in step_mask().
-  #
-  # prompt_strategy: "center_point"
-  #   Geometric default. Works for centered subjects. No DINO needed.
-  #
-  # prompt_strategy: "bbox"
-  #   Full-image bounding box with 5% inset. More robust for off-center subjects.
   sam:
     prompt_strategy:        "center_point"   # "text" | "center_point" | "bbox"
 
-    # Text-prompted segmentation (prompt_strategy: "text" only)
-    # Requires Grounding DINO weights + config; also requires stage1 wiring (see above)
-    text_prompt:            ""               # e.g. "the brick wall" | "wooden floor"
+    # text prompt (prompt_strategy: "text" only — requires Grounding DINO)
+    text_prompt:            ""
     grounding_dino_config:  "GroundingDINO_SwinT_OGC.py"
     grounding_dino_weights: "groundingdino_swint_ogc.pth"
-    box_threshold:          0.35             # lower to ~0.20 if region not detected
+    box_threshold:          0.35
     text_threshold:         0.25
 
-    # SAM quality thresholds (all prompt strategies)
-    pred_iou_thresh:        0.88             # lower to 0.70 if valid masks are rejected
+    pred_iou_thresh:        0.88
     stability_score_thresh: 0.95
     dilation_px:            0                # pixels to dilate mask outward; 0 = no dilation
-                                             # increase to 8–16 if mask clips the subject edge
 
-  # Gaussian decomposition (ablation.decomposition = "gaussian")
-  # kernel must be odd. Larger kernel → smoother LF, more HF detail captured.
-  # sigma: larger → more LF bleed into HF band.
-  gaussian:
-    kernel: 31
-    sigma:  5.0
 
-  # FFT decomposition (ablation.decomposition = "fft")
-  # cutoff_ratio: inner fraction of the spectrum treated as LF.
-  # 0.1 = inner 10% of frequency bins. Raise if LF still shows hard edges.
-  fft:
-    cutoff_ratio: 0.1
+# ── Stage 1b: DDIM inversion ──────────────────────────────────────────────────
+# Runs after stage1. Inverts donor_aligned.png and stores K,V per timestep
+# to artifacts/kv_store/ for use by stage2.
+stage1b:
+  base_model_id:       "Manojb/stable-diffusion-2-1-base"  # 4-channel base UNet for inversion
+  num_inversion_steps: 30    # should match stage2.num_inference_steps
+  torch_dtype:         "float16"
+  enable_cpu_offload:  false
 
 
 # ── Stage 2: Diffusion pipeline ───────────────────────────────────────────────
-# FIX [2]: model_id corrected to the inpainting checkpoint.
-# stage2_diffusion.py loads StableDiffusionInpaintPipeline, which requires
-# a 9-channel UNet (4 latent + 4 masked_latent + 1 mask channel).
-# "stabilityai/stable-diffusion-2-1-base" is a 4-channel base model →
-# channel mismatch at load time or silent garbage output.
-# Correct checkpoint: "stabilityai/stable-diffusion-2-inpainting"
 stage2:
-  model_id:            "stabilityai/stable-diffusion-2-inpainting"
+  model_id:            "stable-diffusion-v1-5/stable-diffusion-inpainting"
   torch_dtype:         "float16"     # "float16" | "float32"
-  enable_cpu_offload:  false         # set true if VRAM < 10 GB (slow)
+  enable_cpu_offload:  false
 
   scheduler:           "DDIM"        # "DDIM" | "PNDM" | "DPMSolver"
 
@@ -143,137 +63,72 @@ stage2:
   negative_prompt: "blurry, smooth, flat color, cartoon, low quality, artifacts"
 
   num_inference_steps: 30
-  denoising_strength:  0.75       # Higher blends prior into context; lower preserves prior more literally
-  anchor_feather_px:   24         # Soft latent anchoring boundary; raise if edge still looks pasted
+  denoising_strength:  0.75
+  anchor_feather_px:   24
   guidance_scale:      7.5
   seed:                42
 
 
 # ── KV Injection ──────────────────────────────────────────────────────────────
-# injection_scale: global λ multiplier for shallow KV blending.
-#   0.0 = no injection (same as shallow_injection: false)
-#   1.0 = full replacement of source K,V with donor K,V inside the mask
-#   Sweep [0.3, 0.5, 0.8, 1.0] for ablation A6.
-#
-# FIX [4]: removed injection.shallow_only — stage2_diffusion.py never reads it.
-#   Shallow-only behaviour is controlled by ablation.shallow_injection below.
-# FIX [6]: removed injection.depth sub-section — patch_unet.py hardcodes its
-#   own prefix tuples (_DEEP_PREFIXES, _SHALLOW_PREFIXES) and does not read
-#   this section. Keeping it here would silently have no effect.
+# injection_scale: global λ for shallow KV blending. A6 sweep: [0.3, 0.5, 0.8, 1.0]
 injection:
-  injection_scale: 0.8     # A6 sweep: [0.3, 0.5, 0.8, 1.0]
+  injection_scale: 0.8
 
 
 # ── Compositing ───────────────────────────────────────────────────────────────
-# Stage 2 now calls core/compositing.py after raw diffusion decode.
-# result.png is composited; raw_diffusion.png is also saved for debugging.
 compositing:
   poisson_blend:   true
-  feather_px:      16       # raise to 24-32 if the transition still looks stitched
+  feather_px:      16
   seam_threshold:  10.0
-  auto_skip:       false    # force cleanup while tuning seams
+  auto_skip:       false
 
 
 # ── Ablation flags ────────────────────────────────────────────────────────────
-# Change ONE flag at a time for a clean ablation study.
-# Each flag maps to exactly one read in stage1_segment.py or stage2_diffusion.py.
 ablation:
 
-  # A1 — Frequency decomposition method (stage1)
-  # "gaussian" : Gaussian blur split (default, no ringing)
-  # "fft"      : FFT rectangular mask split (compare ringing vs Gaussian)
-  # "none"     : no split — whole aligned image used as LF and HF
-  decomposition: "gaussian"
-
-  # A2 — Depth routing (KV injection layer assignment)
-  # NOTE [10]: stage2_diffusion.py currently hardcodes
-  #   kv_cache.depth_routing = "correct"
-  # This yaml value is NOT read by stage2. It controls nothing until
-  # stage2 is updated to read cfg["ablation"]["depth_routing"].
-  # Kept here for documentation and future wiring.
-  # "correct"  : deep=LF, shallow=HF  (proposed; currently hardcoded)
-  # "swapped"  : deep=HF, shallow=LF  (inverted routing — expected to degrade)
-  # "uniform"  : all layers get LF cache (no depth distinction)
+  # A2 — Depth routing: "correct" | "swapped" | "uniform"
+  # Read by kv_cache.depth_routing. stage2 currently hardcodes "correct".
   depth_routing: "correct"
 
-  # A3 — Spatial injection mask (stage1 + stage2 via face_mask tensor)
-  # FIX [8]: "convex_hull" removed — not implemented in segmentation.py or
-  #   stage1_segment.py. The CLI also rejects it (choices: ["sam", "none"]).
-  # "sam"  : SAM segmentation mask (tight semantic boundary)
-  # "none" : global injection, no spatial gating (full-image mask)
+  # A3 — Spatial injection mask: "sam" | "none"
   mask_type: "sam"
 
-  # A4 — Temporal lambda annealing (stage2)
-  # true  : λ_HF ramps 0 → injection_scale over denoising steps
-  #         texture detail injected late (when diffusion fills fine detail)
-  # false : flat λ_HF = injection_scale throughout all steps (baseline)
-  temporal_anneal: true
+  # A4 — Temporal lambda annealing
+  # false = flat λ_HF (principled default — KV is timestep-calibrated from inversion)
+  # true  = ramp 0 → injection_scale (ablation comparison only)
+  temporal_anneal: false
 
-  # A5 — Prior construction mode (stage2)
-  # "full"    : P = α·S_LF + β·R̃_LF + γ·R̃_HF  (proposed)
-  # "chimera" : P = S_LF + R̃_HF               (α=1, β=0, γ=1 shortcut)
-  # "none"    : P = S                           (plain inpainting, no prior)
-  prior_construction: "full"
-
-  # A6 — Blended latent anchoring (stage2)
-  # true  : per-step latent replacement outside mask (proposed)
-  #         guarantees content image is pixel-identical outside mask
-  # false : one-time img2img init only (old baseline; mask region drifts)
+  # A6 — Blended latent anchoring
+  # true  : per-step latent replacement outside mask
+  # false : one-time img2img init only
   blended_anchoring: true
 
-  # A7 — Shallow KV injection on/off (stage2)
-  # true  : donor fine-surface features injected via shallow layers (proposed)
-  # false : pure inpainting, no donor KV — blended anchoring baseline only
+  # A7 — Shallow KV injection on/off
   shallow_injection: true
 
-  # A8 — Histogram matching in prior (stage1)
-  # true  : normalise prior P to content image histogram before embedding
-  # false : raw frequency sum, no histogram correction
-  histogram_match: true
-
-  # A9 — Compositing method (stage2 output post-processing)
-  # NOTE: compositing.py is not wired yet — this flag controls nothing until
-  # compositing is imported and called in stage2_diffusion.py (see compositing
-  # section above). Kept here so ablation_runner.py can sweep it in future.
-  # "freq"   : frequency-decomposed compositing (novel — default)
-  # "simple" : alpha blend + Poisson only (baseline)
+  # A9 — Compositing method: "freq" | "simple"
   compositing: "freq"
 
-  # FIX [5]: removed ablation.mode ("phase3" | "phase2") — never read by
-  #   stage2_diffusion.py. Stage2 always runs the shallow-only inpainting path.
-  # FIX [5]: removed ablation.injection_mode ("chimera" | "split") — never
-  #   read by any uploaded script.
 
-
-# ── Ablation sweep config (used by ablation/ablation_runner.py) ───────────────
-# Defines sweep conditions for systematic comparison.
-# Runner creates one output directory per condition.
+# ── Ablation sweep (ablation/ablation_runner.py) ──────────────────────────────
 ablation_sweep:
 
-  # A6 — injection strength sensitivity
   injection_scale: [0.3, 0.5, 0.8, 1.0]
 
-  # 2×2 compositing ablation:
-  #   freq_injection × freq_compositing
-  # Condition 1: injection=none,  compositing=simple  → baseline (neither)
-  # Condition 2: injection=none,  compositing=freq    → compositing only
-  # Condition 3: injection=kv,    compositing=simple  → injection only
-  # Condition 4: injection=kv,    compositing=freq    → full method (both)
   compositing_conditions:
     - { shallow_injection: false, compositing: "simple" }   # baseline
     - { shallow_injection: false, compositing: "freq"   }   # compositing only
     - { shallow_injection: true,  compositing: "simple" }   # injection only
     - { shallow_injection: true,  compositing: "freq"   }   # full method
 
-  # Pose robustness bucketing (yaw angle bins for reporting)
   yaw_buckets:
-    small:  [0,  15]     # degrees
+    small:  [0,  15]
     medium: [15, 35]
     large:  [35, 999]
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
-  save_intermediates: false   # save LF/HF/aligned debug images alongside result
-  verbose:            true    # print per-step lambda + cache summary in stage2
-  save_meta:          true    # write meta.json to artifacts/ after stage1
+  save_intermediates: false
+  verbose:            true
+  save_meta:          true
