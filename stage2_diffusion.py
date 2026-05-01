@@ -460,49 +460,29 @@ def load_kv_for_timestep(
     device:      torch.device,
     dtype:       torch.dtype,
 ):
-    """
-    Load pre-computed donor K,V tensors for a specific denoising step
-    into the KVCache's _hf_cache, ready for injection.
-
-    Called once per denoising step before the inject pass, replacing the
-    single static _shallow_store_pass() from the old pipeline.
-
-    Each file is named:  kv_store/step{step_idx:03d}_{layer_name}.pt
-    and contains a dict: {"k": tensor, "v": tensor}
-
-    If a file is missing for a layer, that layer is silently skipped —
-    injection falls back gracefully to standard attention for that layer.
-
-    Args:
-        kv_cache     : KVCache instance — _hf_cache will be populated
-        kv_store_dir : Path to artifacts/kv_store/
-        step_idx     : Current denoising step index (0-based)
-        layers       : List of layer name strings to load (shallow layers only)
-        device       : Target device for loaded tensors
-        dtype        : Target dtype (match UNet dtype to avoid cast overhead)
-    """
     kv_cache._hf_cache.clear()
 
     loaded = 0
     for layer_name in layers:
-        # Filename convention matches stage1b_invert.py
         safe_name = layer_name.replace(".", "_")
-        fname     = f"step{step_idx:03d}_{safe_name}.pt"
-        fpath     = os.path.join(kv_store_dir, fname)
+        fpath     = os.path.join(kv_store_dir, f"step{step_idx:03d}_{safe_name}.pt")
 
         if not os.path.exists(fpath):
-            # Missing file — skip this layer, log only on first step
             if step_idx == 0:
-                print(f"[stage2] WARNING: kv_store missing {fname} — layer skipped")
+                print(f"[stage2] WARNING: kv_store missing {os.path.basename(fpath)} — layer skipped")
             continue
 
         kv = torch.load(fpath, map_location=device)
-        k  = kv["k"].to(dtype=dtype)
-        v  = kv["v"].to(dtype=dtype)
-        kv_cache._hf_cache[layer_name] = (k, v)
+        kv_cache._hf_cache[layer_name] = (kv["k"].to(dtype=dtype), kv["v"].to(dtype=dtype))
         loaded += 1
 
-    return loaded
+    # load noisy latent saved by stage1b for this timestep
+    latent_path   = os.path.join(kv_store_dir, f"step{step_idx:03d}_noisy_latent.pt")
+    noisy_latent  = None
+    if os.path.exists(latent_path):
+        noisy_latent = torch.load(latent_path, map_location=device).to(dtype=dtype)
+
+    return loaded, noisy_latent
 
 
 def _get_shallow_layer_names(depth_map: dict) -> list:
@@ -683,14 +663,19 @@ def run_denoising_loop(
         # scheduler timestep value, to match the inversion loop in stage1b.
         unet_dtype = next(pipe.unet.parameters()).dtype
         if shallow_inject:
-            n_loaded = load_kv_for_timestep(
+            n_loaded, donor_noisy = load_kv_for_timestep(
                 kv_cache, kv_store_dir, step_idx,
                 shallow_layers, device, unet_dtype,
             )
             kv_cache.set_mode("inject")
         else:
             kv_cache.set_mode("bypass")
-            n_loaded = 0
+            n_loaded, donor_noisy = 0, None
+
+        # initialise latents from saved donor noisy latent (PnP style)
+        # blended anchoring then overwrites the outside-mask region
+        if donor_noisy is not None:
+            latents = donor_noisy
 
         if verbose and (step_idx % 5 == 0 or step_idx == T - 1):
             print(

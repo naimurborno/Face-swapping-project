@@ -177,27 +177,16 @@ class KVCache:
         source = self._lf_cache if freq == "lf" else self._hf_cache
         return source.get(key, (None, None))
 
-    def save_step(self, step_idx: int, kv_store_dir: str):
+    def save_step(self, step_idx: int, kv_store_dir: str, noisy_latent=None):
         """
-        Flush the current _hf_cache to disk for one inversion step.
+        Flush _hf_cache + noisy latent to disk for one inversion step.
 
-        Called by stage1b_invert.py after each DDIM inversion step to
-        persist the captured K,V tensors. Files are named:
+        K,V files: kv_store/step{step_idx:03d}_{safe_layer_name}.pt  → {"k", "v"}
+        Latent file: kv_store/step{step_idx:03d}_noisy_latent.pt      → tensor
 
-            kv_store/step{step_idx:03d}_{safe_layer_name}.pt
-
-        where safe_layer_name replaces '.' with '_' to avoid path issues.
-        Each file contains a dict {"k": tensor, "v": tensor} saved at the
-        dtype of the stored tensors (float16 recommended for disk efficiency).
-
-        The _hf_cache is NOT cleared after saving — stage1b calls clear()
-        explicitly at the start of each inversion step.
-
-        Args:
-            step_idx    : Denoising step index (0-based). Must match the
-                          step_idx used in stage2's load_kv_for_timestep().
-            kv_store_dir: Destination directory (artifacts/kv_store/).
-                          Created if it does not exist.
+        noisy_latent: (B, 4, H, W) latent at this inversion timestep.
+            Saved separately and loaded by stage2 to initialise each denoising step.
+            If None, only K,V are saved (backward-compatible).
         """
         os.makedirs(kv_store_dir, exist_ok=True)
 
@@ -206,6 +195,10 @@ class KVCache:
             fname     = f"step{step_idx:03d}_{safe_name}.pt"
             fpath     = os.path.join(kv_store_dir, fname)
             torch.save({"k": k.cpu(), "v": v.cpu()}, fpath)
+
+        if noisy_latent is not None:
+            latent_path = os.path.join(kv_store_dir, f"step{step_idx:03d}_noisy_latent.pt")
+            torch.save(noisy_latent.cpu(), latent_path)
 
     def clear(self):
         """

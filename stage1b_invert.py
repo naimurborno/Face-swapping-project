@@ -81,7 +81,7 @@ def print_config(cfg: dict):
     print(f"│  num_inversion_steps: {s1b.get('num_inversion_steps', 30)}")
     print(f"│  torch_dtype        : {s1b.get('torch_dtype', 'float16')}")
     print(f"│  enable_cpu_offload : {s1b.get('enable_cpu_offload', False)}")
-    print(f"│  model_id           : {s1b.get('base_model_id', 'stabilityai/stable-diffusion-2-1-base')}")
+    print(f"│  model_id           : {cfg['stage2']['model_id']}")
     print(f"└───────────────────────────────────────────────────────────\n")
 
 
@@ -90,9 +90,9 @@ def print_config(cfg: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_pipeline(cfg: dict):
-    from diffusers import StableDiffusionPipeline, DDIMScheduler
+    from diffusers import StableDiffusionInpaintPipeline, DDIMScheduler
 
-    model_id  = cfg["stage1b"].get("base_model_id", "stabilityai/stable-diffusion-2-1-base")
+    model_id  = cfg["stage2"]["model_id"]
     dtype_str = cfg["stage1b"].get("torch_dtype", "float16")
     dtype     = torch.float16 if dtype_str == "float16" else torch.float32
     device    = "cuda" if torch.cuda.is_available() else "cpu"
@@ -103,7 +103,7 @@ def load_pipeline(cfg: dict):
 
     print(f"[stage1b] Loading {model_id} ({dtype_str}) ...")
 
-    pipe = StableDiffusionPipeline.from_pretrained(
+    pipe = StableDiffusionInpaintPipeline.from_pretrained(
         model_id,
         torch_dtype    = dtype,
         safety_checker = None,
@@ -147,17 +147,17 @@ def encode_donor(pipe, donor_pil: Image.Image) -> torch.Tensor:
 @torch.no_grad()
 def run_inversion(
     pipe,
-    z0:          torch.Tensor,
-    kv_cache:    KVCache,
+    z0:           torch.Tensor,
+    kv_cache:     KVCache,
     kv_store_dir: str,
-    num_steps:   int,
-    verbose:     bool = True,
+    num_steps:    int,
+    verbose:      bool = True,
 ) -> list:
     device     = next(pipe.unet.parameters()).device
     unet_dtype = next(pipe.unet.parameters()).dtype
 
     pipe.scheduler.set_timesteps(num_steps)
-    timesteps = pipe.scheduler.timesteps  # descending: [T, T-dt, ..., dt]
+    timesteps = pipe.scheduler.timesteps  # descending: [T, ..., dt]
 
     text_inputs = pipe.tokenizer(
         [""],
@@ -166,6 +166,7 @@ def run_inversion(
         truncation     = True,
         return_tensors = "pt",
     )
+    # conditional embedding only — same as PnP
     encoder_hidden_states = pipe.text_encoder(
         text_inputs.input_ids.to(device)
     )[0].to(dtype=unet_dtype)
@@ -173,24 +174,55 @@ def run_inversion(
     latents     = z0.clone().to(dtype=unet_dtype)
     layers_seen = []
 
-    # Inversion: low t → high t
-    for step_idx, t in enumerate(reversed(timesteps)):
+    B, C, H, W = latents.shape
+    mask_dummy = torch.zeros(B, 1, H, W, device=device, dtype=unet_dtype)
+
+    # reversed: low t → high t  (same as PnP: reversed(scheduler.timesteps))
+    reversed_timesteps = list(reversed(timesteps))
+
+    for step_idx, t in enumerate(reversed_timesteps):
         if verbose:
             print(f"[stage1b] Inversion step {step_idx + 1}/{num_steps}  t={int(t)}", end="  ")
+
+        # 9-channel input: masked_latent mirrors current latent (zero mask = full donor visible)
+        unet_input = torch.cat([latents, mask_dummy, latents.clone()], dim=1)
 
         kv_cache.clear()
         kv_cache.set_freq_mode("hf")
         kv_cache.set_mode("store")
 
-        noise_pred = pipe.unet(
-            latents,
-            t,
-            encoder_hidden_states  = encoder_hidden_states,
-            cross_attention_kwargs = {"kv_cache": kv_cache},
-            return_dict            = False,
-        )[0]
+        with torch.autocast(device_type=device.split(":")[0], dtype=torch.float32):
+            eps = pipe.unet(
+                unet_input,
+                t,
+                encoder_hidden_states  = encoder_hidden_states,
+                cross_attention_kwargs = {"kv_cache": kv_cache},
+                return_dict            = False,
+            )[0]
 
-        kv_cache.save_step(step_idx, kv_store_dir)
+            # ── PnP manual DDIM inversion update ──────────────────────────
+            # Matches Tumanyan et al. exactly:
+            #   pred_x0 = (z_t - σ_prev · ε) / μ_prev
+            #   z_{t+1} = μ · pred_x0 + σ · ε
+            t_prev = reversed_timesteps[step_idx - 1] if step_idx > 0 else t
+
+            alpha_prod_t      = pipe.scheduler.alphas_cumprod[t]
+            alpha_prod_t_prev = (
+                pipe.scheduler.alphas_cumprod[t_prev]
+                if step_idx > 0
+                else pipe.scheduler.final_alpha_cumprod
+            )
+
+            mu      = alpha_prod_t      ** 0.5
+            mu_prev = alpha_prod_t_prev ** 0.5
+            sigma   = (1 - alpha_prod_t)      ** 0.5
+            sigma_prev = (1 - alpha_prod_t_prev) ** 0.5
+
+            pred_x0 = (latents - sigma_prev * eps) / mu_prev
+            latents = mu * pred_x0 + sigma * eps
+
+        # save K,V + noisy latent for this timestep
+        kv_cache.save_step(step_idx, kv_store_dir, noisy_latent=latents)
         kv_cache.set_mode("bypass")
 
         if step_idx == 0:
@@ -198,8 +230,6 @@ def run_inversion(
             print(f"captured {len(layers_seen)} shallow layers")
         elif verbose:
             print(f"saved {len(kv_cache.hf_keys())} layers")
-
-        latents = pipe.scheduler.step(noise_pred, t, latents).prev_sample
 
     kv_cache.set_mode("bypass")
     print(f"[stage1b] Inversion complete. kv_store: {kv_store_dir}")
